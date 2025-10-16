@@ -1,5 +1,6 @@
 # HypoSpace: Evaluating LLM Creativity as Set-Valued Hypothesis Generators under Underdetermination
-**Paper:** [![arXiv](https://img.shields.io/badge/arXiv-2401.01234-b31b1b.svg)]([https://arxiv.org/])
+
+**Paper:** [![arXiv](https://img.shields.io/badge/arXiv-2401.01234-b31b1b.svg)](https://arxiv.org/abs/2401.01234)
 
 
 
