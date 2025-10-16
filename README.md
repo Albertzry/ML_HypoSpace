@@ -5,8 +5,8 @@
 
 
 <p align="center">
-  <img src="figs/overview.png" alt="Overview" width="49%">
-  <img src="figs/comp.png" alt="Model Comparison" width="49%">
+  <img src="figs/overview.png" alt="Overview" height="220">
+  <img src="figs/comp.png" alt="Model Comparison" height="220">
 </p>
 
 ## Abstract
