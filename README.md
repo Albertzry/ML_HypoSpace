@@ -36,9 +36,36 @@ HypoSpace/
 
 ## Scripts
 
-### Create datasets
+### 1. Modify Configuration
+
+Edit the YAML config files to customize:
+- LLM provider and model
+- Temperature settings
+- Output paths
+- Checkpoint directories
+
+Example config (`config/config_gpt4o.yaml`):
+```yaml
+llm:
+  type: openrouter
+  models:
+    openrouter: "openai/gpt-4o"
+  api_keys:
+    openrouter: "your-api-key"
+  temperature: 0.7
+
+benchmark:
+  checkpoint: "checkpoints"
+  verbose: true
+  output_pattern: "results/{dataset_name}_{model}.json"
+```
+
+### 2. Create datasets
+Each domain has its own dataset generator:
+
 Example: generate causal dataset with 3 nodes
 ```bash
+cd causal
 nohup python -u generate_causal_dataset.py \
   --nodes 3 \
   --seed 33550336 \
@@ -46,7 +73,9 @@ nohup python -u generate_causal_dataset.py \
   > log_datasets_node03 2>&1 &
 ```
 
-### Run Benchmark 
+### 3. Run Benchmark 
+Run benchmarks for each domain:
+
 Example: for causal dataset with 3 nodes
 ```bash
 nohup python -u run_causal_benchmark.py \
@@ -56,3 +85,11 @@ nohup python -u run_causal_benchmark.py \
       --query-multiplier "1.0" \
       --seed "33550336" > gpt4o_node03 2>&1 &
 ```
+
+### 4. Output
+
+Results are saved as JSON files containing:
+- Model responses
+- Accuracy metrics
+- Detailed evaluation statistics
+- Timestamps and metadata
