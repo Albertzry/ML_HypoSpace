@@ -16,9 +16,9 @@
 </div>
 
 <p align="center">
-  <img src="figs/overview.png" alt="Overview" width="42%">
+  <img src="figs/overview.png" alt="Overview" height="220">
   &nbsp;&nbsp;&nbsp;
-  <img src="figs/comp.png" alt="Model Comparison" width="42%">
+  <img src="figs/comp.png" alt="Model Comparison" height="220">
 </p>
 
 <p align="center">
