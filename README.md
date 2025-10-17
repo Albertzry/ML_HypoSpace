@@ -162,14 +162,17 @@ cd 3d
 python generate_3d_dataset_complete.py \
   --grid-size 3 \
   --max-height 3 \
-  --seed 42 \
+  --max-blocks 1 \
+  --fixed \
+  --seed 33550336 \
   --output "datasets/3d_grid3_h3.json"
 ```
 
 **Parameters:**
 - `--grid-size`: Grid dimensions (e.g., 3 for 3×3)
 - `--max-height`: Maximum structure height
-- `--seed`: Random seed
+- `--max-blocks`: Maximum number of blocks in top view
+- `--fixed`: If set, generate only structures with exactly max-blocks blocks, else from 1 to max-blocks
 - `--output`: Output file path
 
 </details>
@@ -180,17 +183,15 @@ python generate_3d_dataset_complete.py \
 ```bash
 cd boolean
 python boolean_dataset.py \
-  --variables "x,y" \
-  --operators "AND,OR,NOT" \
-  --max-depth 3 \
-  --seed 12345 \
-  --output "datasets/boolean_2var.json"
+  --operators basic \
+  --max-depth 2 \
+  --output 'datasets/boolean_2var.json' \
+  --seed 33550336 \
 ```
 
 **Parameters:**
-- `--variables`: Comma-separated variable names
-- `--operators`: Allowed Boolean operators
-- `--max-depth`: Max expression tree depth
+- `--operators`: Allowed Boolean operators: choices=['basic', 'extended', 'full']
+- `--max-depth`: Maximum expression depth
 - `--output`: Output JSON file
 
 </details>
@@ -232,9 +233,9 @@ cd 3d
 python run_3d_benchmark.py \
   --dataset "datasets/3d_grid3_h3.json" \
   --config "config/config_gpt4o.yaml" \
-  --n-samples 50 \
-  --query-multiplier 1.5 \
-  --seed 42
+  --n-samples 30 \
+  --query-multiplier 1.0 \
+  --seed 33550336
 ```
 
 </details>
@@ -247,9 +248,9 @@ cd boolean
 python boolean_benchmark.py \
   --dataset "datasets/boolean_2var.json" \
   --config "config/config_gpt4o.yaml" \
-  --n-samples 40 \
-  --query-multiplier 2.0 \
-  --seed 12345
+  --n-samples 30 \
+  --query-multiplier 1.0 \
+  --seed 33550336
 ```
 
 </details>
@@ -292,8 +293,8 @@ Results are automatically saved as JSON files in the `results/` directory.
 | Metric | Range | Good Score | Interpretation |
 |--------|-------|------------|----------------|
 | 🎯 **Validity** | 0-1 | > 0.90 | Model proposes correct hypotheses |
-| ✨ **Uniqueness** | 0-1 | > 0.75 | Model avoids redundant proposals |
-| 📈 **Recovery** | 0-1 | > 0.60 | Model explores solution space well |
+| ✨ **Uniqueness** | 0-1 | > 0.80 | Model avoids redundant proposals |
+| 📈 **Recovery** | 0-1 | > 0.80 | Model explores solution space well |
 
 ---
 
@@ -302,7 +303,6 @@ Results are automatically saved as JSON files in the `results/` directory.
 | Provider | Example Models | Config Type |
 |----------|----------------|-------------|
 | **OpenAI** | GPT-4o, GPT-4-turbo, GPT-3.5 | `openai` |
-| **Anthropic** | Claude 3 Opus, Sonnet, Haiku | `anthropic` |
 | **OpenRouter** | Any model via OpenRouter | `openrouter` |
 
 ---
