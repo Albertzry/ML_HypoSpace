@@ -182,7 +182,7 @@ class Benchmark3D:
             return np.array(obs_data.get('observation', []))
     
     def create_prompt(self, observations, prior_structures=None) -> str:
-        """Create prompt for LLM from observations.
+        """Create enhanced prompt for LLM from observations with improved reasoning guidance.
         
         Args:
             observations: The observation data
@@ -205,105 +205,121 @@ class Benchmark3D:
         # Get metadata for max height if available
         max_height = self.metadata.get('max_height', 3)
         
-        prompt = f"""You are given observations of a 3D structure made of unit blocks on a {grid_size}x{grid_size} grid.
-        Each observation shows a view of the structure from a specific angle.
-        The maximum height of the structure is {max_height} layers.
-
-        Observations (Top View - shows 1 if ANY layer has a block at that position):
-        """
-        # Handle both formats
-        if isinstance(observations, str):
-            # Compact format: single string
-            observation = self._parse_observation(observations)
-            prompt += f"\nTop view:\n"
-            for row in observation:
-                prompt += " ".join(str(cell) for cell in row) + "\n"
-        elif isinstance(observations, list):
-            # Old format: list of observation dicts
-            for i, obs in enumerate(observations):
-                if isinstance(obs, dict):
-                    observation = np.array(obs['observation'])
-                else:
-                    observation = self._parse_observation(obs)
-                prompt += f"\nTop view:\n"
-                for row in observation:
-                    prompt += " ".join(str(cell) for cell in row) + "\n"
-        else:
-            # Single observation dict
-            observation = self._parse_observation(observations)
-            prompt += f"\nTop view:\n"
-            for row in observation:
-                prompt += " ".join(str(cell) for cell in row) + "\n"
+        # Parse observation for analysis
+        observation = self._parse_observation(observations)
+        num_positions = int(np.sum(observation))
         
-        # Add history of prior structures if provided
+        prompt = f"""You are solving a 3D structure inference problem. Given a top-down view of a structure made of unit blocks, you need to determine one possible 3D configuration.
+
+TOP VIEW (shows positions with blocks at ANY height):
+"""
+        # Display observation with coordinate labels for clarity
+        prompt += "    "
+        for c in range(grid_size):
+            prompt += f"c{c} "
+        prompt += "\n"
+        
+        for r, row in enumerate(observation):
+            prompt += f"r{r}  "
+            prompt += " ".join(str(cell) for cell in row) + "\n"
+        
+        prompt += f"""
+PROBLEM ANALYSIS:
+- Grid size: {grid_size}×{grid_size}
+- Positions with blocks: {num_positions} (marked as '1' in top view)
+- Maximum height: {max_height} layers
+- Each position with a '1' can have blocks at heights 1 to {max_height}
+
+PHYSICAL CONSTRAINTS (CRITICAL):
+1. ✓ Gravity: Every block MUST be supported. A block at height h requires a block at height h-1 at the SAME position.
+2. ✓ Layer 1 is the BOTTOM/GROUND layer (must contain all or subset of blocks shown in top view)
+3. ✓ Blocks can only exist at positions marked '1' in the top view
+4. ✓ Each position can have 0 to {max_height} blocks stacked vertically
+
+INFERENCE STRATEGY:
+Think about the HEIGHT of each block position. For each '1' in the top view, decide how many layers tall that block tower should be (1 to {max_height}).
+"""
+
+        # Add diversity guidance based on prior structures
         if prior_structures and len(prior_structures) > 0:
-            prompt += "\n\nPrior 3D structure generated (do not repeat if avoidable):\n"
-            for idx, struct in enumerate(prior_structures, 1):
-                prompt += f"\nAttempt {idx}:\n"
-                prompt += struct.to_string() + "\n"
-        
-        prompt += f"""
-        
-        Task: Infer the complete 3D structure that could produce these observations.
+            prompt += f"""
+PREVIOUSLY GENERATED STRUCTURES ({len(prior_structures)} total):
+"""
+            # Show compact representation of prior structures
+            for idx, struct in enumerate(prior_structures[-5:], 1):  # Show last 5
+                heights = self._extract_height_signature(struct, observation)
+                prompt += f"  Structure {idx}: Heights per position = {heights}\n"
+            
+            prompt += f"""
+DIVERSITY REQUIREMENT:
+- Generate a DIFFERENT structure by choosing different heights for block positions
+- Vary which positions have tall vs short blocks
+- Explore alternative height combinations not yet generated
+- Ensure the new structure is distinguishable from prior attempts
+"""
+        else:
+            prompt += """
+EXPLORATION STRATEGY:
+Consider different possible height configurations:
+- All blocks at height 1 (flat structure)
+- Some blocks taller than others (varied heights)
+- Systematic variations in block heights
+"""
 
-        Structure specifications:
-        - Grid size: {grid_size}x{grid_size}
-        - Maximum height: {max_height} layers
-        - The structure consists of layers stacked from bottom to top, where each layer is a {grid_size}x{grid_size} grid with 0 (empty) or 1 (block).
-        
-        Important constraints:
-        1. Layer 1 is the BOTTOM layer (ground level) - it should contain blocks, not be all zeros
-        2. Blocks must be supported from below (a block at height h requires a block at height h-1 in the same position)
-        3. Do not add unnecessary empty layers at the bottom or top
-        4. Layers are numbered from bottom (Layer 1) to top (Layer N)
-        5. Do not exceed the maximum height of {max_height} layers
-        """
-        
-        if prior_structures:
-            prompt += f"""\n        6. Generate a DIFFERENT valid structure from the {len(prior_structures)} prior attempts shown above
-        7. Two structures are considered equivalent if they have the same blocks in the same positions across all layers
-        """
-        
         prompt += f"""
 
-        Provide your answer as a 3D structure with each layer specified.
+OUTPUT FORMAT (CRITICAL - FOLLOW EXACTLY):
+Structure:
+Layer 1:
+[{grid_size} space-separated values (0 or 1) for row 0]
+[{grid_size} space-separated values (0 or 1) for row 1]
+{"[continue for all " + str(grid_size) + " rows]" if grid_size > 2 else ""}
+Layer 2:
+[same format as Layer 1]
+[continue for additional layers if needed]
 
-        Output format:
-        Structure:
-        Layer 1:  (bottom layer - should contain at least one block)
-        [row 1 values separated by spaces]
-        [row 2 values separated by spaces]
-        ...
-        Layer 2:
-        [row 1 values separated by spaces]
-        [row 2 values separated by spaces]
-        ...
-        (continue for all layers needed, up to maximum {max_height} layers)
+VALID EXAMPLE (3×3 grid, 2 layers):
+Structure:
+Layer 1:
+1 0 1
+0 1 0
+1 0 1
+Layer 2:
+1 0 0
+0 1 0
+0 0 1
+
+This means:
+- Position (0,0): 2 blocks tall (has block in Layer 1 AND Layer 2)
+- Position (1,1): 2 blocks tall
+- Position (0,2): 1 block tall (only in Layer 1)
+- Position (2,0): 1 block tall (only in Layer 1)
+- Position (2,2): 2 blocks tall
+
+CHECKLIST BEFORE OUTPUTTING:
+□ Layer 1 contains blocks (not all zeros)
+□ Every block in higher layers has support below it (same position in layer below)
+□ Only positions marked '1' in top view have blocks
+□ Used only spaces to separate values (no commas)
+□ Number of layers ≤ {max_height}
+□ Structure is different from previously generated ones (if any)
+
+Now generate ONE valid 3D structure:"""
         
-        Example of CORRECT output format for a 3x3 grid:
-        Structure:
-        Layer 1:
-        1 0 1
-        0 0 0
-        1 0 1
-        Layer 2:
-        1 0 0
-        0 0 0
-        0 0 1
-        
-        Note: This represents a 3x3x2 structure where:
-        - Layer 1 (bottom) has blocks at corners: (0,0), (0,2), (2,0), (2,2)
-        - Layer 2 (top) has blocks at (0,0) and (2,2), both supported by blocks in Layer 1 below
-        - Every '1' in Layer 2 has a '1' directly below it in Layer 1 (physical support requirement)
-        - Uses spaces between digits (not commas or other separators)
-        
-        INCORRECT formats to avoid:
-        1. Don't start with empty bottom layer: Layer 1 should contain blocks
-        2. Don't use commas: "1,0,1" - use spaces instead: "1 0 1"
-        3. Don't add blocks without support below them (physics violation)
-        4. Don't exceed {max_height} layers in height
-        """
         return prompt
+    
+    def _extract_height_signature(self, structure: Structure3D, observation: np.ndarray) -> str:
+        """Extract height signature for each position in the observation for diversity tracking."""
+        heights = []
+        for r in range(observation.shape[0]):
+            for c in range(observation.shape[1]):
+                if observation[r, c] == 1:
+                    h = 0
+                    for layer in structure.layers:
+                        if layer[r, c] == 1:
+                            h += 1
+                    heights.append(f"({r},{c}):{h}")
+        return ", ".join(heights) if heights else "none"
     
     def validate_structure_matches_observations(self, structure: Structure3D, observations) -> bool:
         """Check if a structure matches the given observations."""
