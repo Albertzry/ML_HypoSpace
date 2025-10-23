@@ -312,9 +312,9 @@ Results are automatically saved as JSON files in the `results/` directory.
 If you use HypoSpace in your research, please cite:
 
 ```bibtex
-@article{hypospace2025,
+@article{chen2025hypospace,
   title={HypoSpace: Evaluating LLM Creativity as Set-Valued Hypothesis Generators under Underdetermination},
-  author={Tingting Chen, Beibei Lin, Zifeng Yuan, Qiran Zou, Hongyu He, Yew-Soon Ong, Anirudh Goyal, Dianbo Liu},
+  author={Chen, Tingting and Lin, Beibei and Yuan, Zifeng and Zou, Qiran and He, Hongyu and Ong, Yew-Soon and Goyal, Anirudh and Liu, Dianbo},
   journal={arXiv preprint arXiv:2510.15614},
   year={2025}
 }
