@@ -1,17 +1,53 @@
 llm:
   type: openrouter
   models:
-    openrouter: "openai/gpt-4o"
+    openrouter: "deepseek/deepseek-chat-v3-0324"
     openai: Null
     anthropic: Null
   api_keys:
     openrouter: ""
     openai: ""
     anthropic: ""
-  temperature: 0.7
+  temperature: 0.85
 
 benchmark:
   checkpoint: "checkpoints"
   verbose: true
-  output_pattern: "results/{dataset_name}_{model}.json"
+  output_pattern: "results/{dataset_name}_{model}_optimized.json"
+  
+  # Optimization settings
+  use_optimized: true  # Enable ML-based optimization methods
+  use_ensemble: true  # Use self-consistency ensemble
+  use_beam_search: true  # Use beam search
+  use_optimization: true  # Use local search optimization
+  
+  # Ensemble and beam search parameters
+  ensemble_size: 3  # Number of candidates per ensemble generation
+  beam_size: 3  # Beam size for beam search
+  
+  # Loss function weights
+  loss_weights:
+    observation: 1.0  # Weight for observation matching loss
+    physics: 0.5  # Weight for physical constraint violations
+    complexity: 0.2  # Weight for structural complexity
+    diversity: 0.1  # Weight for diversity encouragement
+  
+  # Reward function parameters
+  reward_params:
+    valid_reward: 10.0  # Reward for valid structures
+    match_reward: 5.0  # Reward for partial observation matching
+    gravity_penalty: 2.0  # Penalty per gravity violation
+    diversity_bonus: 1.0  # Bonus for novel structures
+  
+  # Optimization parameters
+  optimization:
+    max_iterations: 20  # Maximum iterations for local search
+    initial_temp: 1.0  # Initial temperature for simulated annealing
+  
+  # Scoring weights
+  scoring_weights:
+    validity: 0.4  # Weight for observation validity
+    physics: 0.3  # Weight for physical constraints
+    quality: 0.2  # Weight for structural quality
+    diversity: 0.1  # Weight for novelty
 
