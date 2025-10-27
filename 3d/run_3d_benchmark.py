@@ -16,6 +16,8 @@ import traceback
 sys.path.append(str(Path(__file__).parent))
 
 from modules.llm_interface import LLMInterface, OpenRouterLLM, OpenAILLM, AnthropicLLM
+from modules.optimization import StructureLoss, StructureOptimizer, RewardFunction
+from modules.ensemble import SelfConsistencyEnsemble, BeamSearch, ConstraintBasedScoring
 
 
 class Structure3D:
@@ -303,6 +305,8 @@ CHECKLIST BEFORE OUTPUTTING:
 □ Used only spaces to separate values (no commas)
 □ Number of layers ≤ {max_height}
 □ Structure is different from previously generated ones (if any)
+
+IMPORTANT: Output ONLY the structure, nothing else. No explanation, no reasoning, just the structure.
 
 Now generate ONE valid 3D structure:"""
         
@@ -699,6 +703,357 @@ Now generate ONE valid 3D structure:"""
             'unique_structures': [s.to_string() for s in unique_structures]
         }
     
+    def evaluate_single_observation_set_optimized(
+        self,
+        llm: LLMInterface,
+        observation_set: Dict,
+        n_queries: int = 10,
+        verbose: bool = True,
+        max_retries: int = 3,
+        use_ensemble: bool = True,
+        use_beam_search: bool = True,
+        use_optimization: bool = True,
+        ensemble_size: int = 3,
+        beam_size: int = 3
+    ) -> Dict:
+        """
+        Evaluate LLM on a single observation set with advanced optimization.
+        
+        Integrates:
+        - Loss function for structure evaluation
+        - Search algorithm for local optimization
+        - Reward function for RL-style scoring
+        - Self-consistency ensemble
+        - Beam search
+        - Constraint-based scoring
+        
+        Args:
+            llm: LLM interface
+            observation_set: Observation set to evaluate
+            n_queries: Number of queries to make
+            verbose: Print progress
+            max_retries: Max retries per query
+            use_ensemble: Use self-consistency ensemble
+            use_beam_search: Use beam search
+            use_optimization: Use local search optimization
+            ensemble_size: Number of candidates per ensemble
+            beam_size: Beam size for beam search
+        
+        Returns:
+            Results dictionary with metrics and generated structures
+        """
+        
+        # Get observations and ground truth structures
+        observations = observation_set.get('observation', observation_set.get('observations', []))
+        ground_truth_structures = observation_set.get('ground_truth_structures', [])
+        
+        # Parse observation
+        observation = self._parse_observation(observations)
+        
+        # Get ground truth hashes
+        gt_hashes = set()
+        for gt in ground_truth_structures:
+            if 'layers' in gt and isinstance(gt['layers'][0], str):
+                layers = []
+                grid_size = int(len(gt['layers'][0]) ** 0.5)
+                for layer_str in gt['layers']:
+                    layer = []
+                    for i in range(grid_size):
+                        row = [int(layer_str[i * grid_size + j]) for j in range(grid_size)]
+                        layer.append(row)
+                    layers.append(layer)
+                struct = Structure3D(layers)
+                gt_hashes.add(struct.get_hash())
+            else:
+                struct = Structure3D(gt['layers'])
+                gt_hashes.add(struct.get_hash())
+        
+        # Initialize optimization components
+        loss_fn = StructureLoss(
+            obs_weight=1.0,
+            physics_weight=0.5,
+            complexity_weight=0.2,
+            diversity_weight=0.1
+        )
+        
+        optimizer = StructureOptimizer(
+            loss_fn=loss_fn,
+            max_iterations=20,
+            initial_temp=1.0
+        )
+        
+        reward_fn = RewardFunction(
+            valid_reward=10.0,
+            match_reward=5.0,
+            gravity_penalty=2.0,
+            diversity_bonus=1.0
+        )
+        
+        scorer = ConstraintBasedScoring(
+            validity_weight=0.4,
+            physics_weight=0.3,
+            quality_weight=0.2,
+            diversity_weight=0.1
+        )
+        
+        if use_ensemble:
+            ensemble = SelfConsistencyEnsemble(
+                n_candidates=ensemble_size,
+                voting_method="weighted"
+            )
+        
+        if use_beam_search:
+            beam_search = BeamSearch(
+                beam_size=beam_size,
+                max_iterations=3
+            )
+        
+        # Track results
+        all_hypotheses = []
+        valid_hypotheses = []
+        unique_hashes = set()
+        unique_structures = []
+        parse_success_count = 0
+        prior_structures = []
+        
+        # Token and cost tracking
+        total_prompt_tokens = 0
+        total_completion_tokens = 0
+        total_tokens = 0
+        total_cost = 0.0
+        
+        # Error tracking
+        errors = []
+        error_counts = {}
+        
+        # Optimization stats
+        optimization_stats = {
+            'n_optimized': 0,
+            'avg_loss_improvement': 0.0,
+            'ensemble_uses': 0,
+            'beam_search_uses': 0
+        }
+        
+        queries_made = 0
+        used_queries_this_iteration = 0
+        
+        while queries_made < n_queries:
+            structures_generated = []
+            used_queries_this_iteration = 0
+            
+            # Strategy selection based on progress
+            if use_beam_search and queries_made % 5 == 0 and queries_made < n_queries - 2:
+                # Use beam search every 5 queries
+                if verbose:
+                    print(f"  Using beam search (query {queries_made + 1})")
+                
+                def score_fn_wrapper(struct, obs):
+                    is_valid = self.validate_structure_matches_observations(struct, obs)
+                    return scorer.score(struct, obs, is_valid)
+                
+                try:
+                    beam_results = beam_search.search(
+                        llm_interface=llm,
+                        prompt_fn=lambda obs, prior: self.create_prompt(obs, prior),
+                        parse_fn=self.parse_llm_response,
+                        score_fn=score_fn_wrapper,
+                        observation=observation,
+                        initial_structures=unique_structures[-beam_size:] if unique_structures else None
+                    )
+                    
+                    for struct, score in beam_results:
+                        if struct:
+                            structures_generated.append(struct)
+                    
+                    optimization_stats['beam_search_uses'] += 1
+                    used_queries_this_iteration = beam_size  # Beam search uses multiple queries
+                    
+                except Exception as e:
+                    if verbose:
+                        print(f"  Beam search failed: {e}")
+                        print(f"  Exception details: {traceback.format_exc()}")
+                    # Fall back to regular generation
+                    structures_generated = []
+            
+            elif use_ensemble and queries_made < n_queries:
+                # Use ensemble generation
+                if verbose:
+                    print(f"  Using ensemble (query {queries_made + 1})")
+                
+                try:
+                    ensemble_structures = ensemble.generate_ensemble(
+                        llm_interface=llm,
+                        prompt_fn=lambda obs, prior: self.create_prompt(obs, prior),
+                        parse_fn=self.parse_llm_response,
+                        validate_fn=self.validate_structure_matches_observations,
+                        observation=observations,
+                        prior_structures=unique_structures
+                    )
+                    
+                    structures_generated.extend(ensemble_structures)
+                    optimization_stats['ensemble_uses'] += 1
+                    used_queries_this_iteration = ensemble_size
+                    
+                except Exception as e:
+                    if verbose:
+                        print(f"  Ensemble failed: {e}")
+                        print(f"  Exception details: {traceback.format_exc()}")
+                    structures_generated = []
+            
+            # If no structures were generated by beam_search or ensemble, fall back to regular generation
+            if not structures_generated and queries_made < n_queries:
+                # Regular single generation
+                prompt = self.create_prompt(observations, prior_structures=unique_structures)
+                
+                structure = None
+                for attempt in range(max_retries):
+                    try:
+                        if hasattr(llm, 'query_with_usage'):
+                            result = llm.query_with_usage(prompt)
+                            response = result['response']
+                            
+                            usage = result.get('usage', {})
+                            total_prompt_tokens += usage.get('prompt_tokens', 0)
+                            total_completion_tokens += usage.get('completion_tokens', 0)
+                            total_tokens += usage.get('total_tokens', 0)
+                            total_cost += result.get('cost', 0.0)
+                        else:
+                            response = llm.query(prompt)
+                        
+                        if response and not response.startswith("Error querying"):
+                            structure = self.parse_llm_response(response)
+                            if structure:
+                                structure = structure.normalize()
+                                # Don't count here, count in processing loop
+                                break
+                    
+                    except Exception as e:
+                        if verbose and attempt == max_retries - 1:
+                            print(f"  Error on query {queries_made + 1}: {str(e)[:100]}")
+                
+                if structure:
+                    structures_generated.append(structure)
+                
+                if used_queries_this_iteration == 0:
+                    used_queries_this_iteration = 1  # Regular generation counts as 1 query
+            
+            # CRITICAL FIX: Always increment queries_made based on used_queries_this_iteration
+            # This ensures the loop makes progress even when beam_search/ensemble fail
+            queries_made += used_queries_this_iteration
+            
+            if used_queries_this_iteration == 0:
+                # Emergency fallback: if somehow nothing happened, force increment
+                queries_made += 1
+                if verbose:
+                    print(f"  Warning: Emergency increment to avoid infinite loop")
+            
+            # Process generated structures
+            for structure in structures_generated:
+                if not structure:
+                    continue
+                
+                # Count parse success for structures from ensemble/beam_search
+                parse_success_count += 1
+                
+                # Apply local optimization if enabled
+                if use_optimization:
+                    try:
+                        initial_loss = loss_fn.compute_loss(structure, observation)
+                        optimized_structure, final_loss = optimizer.optimize(structure, observation)
+                        
+                        if final_loss < initial_loss:
+                            structure = optimized_structure
+                            optimization_stats['n_optimized'] += 1
+                            optimization_stats['avg_loss_improvement'] += (initial_loss - final_loss)
+                    
+                    except Exception as e:
+                        if verbose:
+                            print(f"  Optimization failed: {e}")
+                
+                # Add to all hypotheses
+                all_hypotheses.append(structure)
+                
+                # Update loss function's known structures
+                loss_fn.update_known_structures(structure)
+                
+                # Check uniqueness
+                s_hash = structure.get_hash()
+                if s_hash not in unique_hashes:
+                    unique_hashes.add(s_hash)
+                    unique_structures.append(structure)
+                    prior_structures = unique_structures[-10:] if len(unique_structures) > 10 else unique_structures.copy()
+                
+                # Check validity
+                if self.validate_structure_matches_observations(structure, observations):
+                    valid_hypotheses.append(structure)
+        
+        # Calculate average loss improvement
+        if optimization_stats['n_optimized'] > 0:
+            optimization_stats['avg_loss_improvement'] /= optimization_stats['n_optimized']
+        
+        # Calculate metrics
+        parse_success_rate = parse_success_count / queries_made if queries_made > 0 else 0
+        valid_rate = len(valid_hypotheses) / queries_made if queries_made > 0 else 0
+        novelty_rate = len(unique_structures) / queries_made if queries_made > 0 else 0
+        
+        # Check recovery
+        recovered_gts = set()
+        for struct in valid_hypotheses:
+            s_hash = struct.get_hash()
+            if s_hash in gt_hashes:
+                recovered_gts.add(s_hash)
+        
+        recovery_rate = len(recovered_gts) / len(gt_hashes) if gt_hashes else 0
+        
+        # Compute additional metrics
+        avg_reward = 0.0
+        avg_score = 0.0
+        for struct in valid_hypotheses:
+            is_valid = True
+            reward = reward_fn.compute_reward(struct, observation, is_valid)
+            score = scorer.score(struct, observation, is_valid)
+            avg_reward += reward
+            avg_score += score
+        
+        if valid_hypotheses:
+            avg_reward /= len(valid_hypotheses)
+            avg_score /= len(valid_hypotheses)
+        
+        # Get observation set ID
+        obs_id = observation_set.get('observation_id', observation_set.get('observation_set_id', 'unknown'))
+        n_obs = 1 if isinstance(observations, str) else len(observations)
+        
+        return {
+            'observation_set_id': obs_id,
+            'n_observations': n_obs,
+            'n_ground_truths': len(ground_truth_structures),
+            'n_queries': queries_made,
+            'n_valid': len(valid_hypotheses),
+            'n_unique': len(unique_structures),
+            'n_recovered_gts': len(recovered_gts),
+            'parse_success_count': parse_success_count,
+            'parse_success_rate': parse_success_rate,
+            'valid_rate': valid_rate,
+            'novelty_rate': novelty_rate,
+            'recovery_rate': recovery_rate,
+            'avg_reward': avg_reward,
+            'avg_score': avg_score,
+            'optimization_stats': optimization_stats,
+            'token_usage': {
+                'prompt_tokens': total_prompt_tokens,
+                'completion_tokens': total_completion_tokens,
+                'total_tokens': total_tokens
+            },
+            'cost': total_cost,
+            'errors': errors,
+            'error_summary': {
+                'total_errors': len(errors),
+                'error_types': error_counts
+            },
+            'all_hypotheses': [h.to_string() for h in all_hypotheses],
+            'unique_structures': [s.to_string() for s in unique_structures]
+        }
+    
     def run_benchmark(
         self,
         llm: LLMInterface,
@@ -710,7 +1065,13 @@ Now generate ONE valid 3D structure:"""
         verbose: bool = True,
         checkpoint_dir: str = "checkpoints",
         run_id: Optional[str] = None,
-        max_retries: int = 3
+        max_retries: int = 3,
+        use_optimized: bool = False,
+        use_ensemble: bool = True,
+        use_beam_search: bool = True,
+        use_optimization: bool = True,
+        ensemble_size: int = 3,
+        beam_size: int = 3
     ) -> Dict:
         """Run enhanced benchmark with comprehensive tracking.
         
@@ -725,6 +1086,12 @@ Now generate ONE valid 3D structure:"""
             checkpoint_dir: Directory to save checkpoints
             run_id: Run identifier for checkpoint
             max_retries: Maximum retries per query
+            use_optimized: Use optimized evaluation with ML methods
+            use_ensemble: Use self-consistency ensemble (if use_optimized=True)
+            use_beam_search: Use beam search (if use_optimized=True)
+            use_optimization: Use local search optimization (if use_optimized=True)
+            ensemble_size: Number of candidates per ensemble
+            beam_size: Beam size for beam search
         
         Returns:
             Dictionary with complete benchmark results including statistics, token usage, and costs
@@ -829,10 +1196,20 @@ Now generate ONE valid 3D structure:"""
                     if verbose:
                         print(f"  Using {n_queries} queries ({query_multiplier}x {n_gt} ground truths)")
                 
-                # Evaluate
-                result = self.evaluate_single_observation_set(
-                    llm, obs_set, n_queries, verbose=False, max_retries=max_retries
-                )
+                # Evaluate - use optimized method if enabled
+                if use_optimized:
+                    result = self.evaluate_single_observation_set_optimized(
+                        llm, obs_set, n_queries, verbose=False, max_retries=max_retries,
+                        use_ensemble=use_ensemble,
+                        use_beam_search=use_beam_search,
+                        use_optimization=use_optimization,
+                        ensemble_size=ensemble_size,
+                        beam_size=beam_size
+                    )
+                else:
+                    result = self.evaluate_single_observation_set(
+                        llm, obs_set, n_queries, verbose=False, max_retries=max_retries
+                    )
                 
                 all_results.append(result)
             
@@ -1073,6 +1450,14 @@ def main():
     parser.add_argument("--verbose", action="store_true", default=True, help="Verbose output")
     parser.add_argument("--quiet", action="store_true", help="Disable verbose output")
     
+    # Optimization arguments
+    parser.add_argument("--use-optimized", action="store_true", help="Use optimized evaluation with ML methods (loss function, search, rewards)")
+    parser.add_argument("--use-ensemble", action="store_true", default=True, help="Use self-consistency ensemble (if --use-optimized)")
+    parser.add_argument("--use-beam-search", action="store_true", default=True, help="Use beam search (if --use-optimized)")
+    parser.add_argument("--use-optimization", action="store_true", default=True, help="Use local search optimization (if --use-optimized)")
+    parser.add_argument("--ensemble-size", type=int, default=3, help="Number of candidates per ensemble")
+    parser.add_argument("--beam-size", type=int, default=3, help="Beam size for beam search")
+    
     args = parser.parse_args()
     
     # Handle verbose/quiet flags
@@ -1158,7 +1543,13 @@ def main():
         verbose=verbose,
         checkpoint_dir=checkpoint_dir,
         run_id=run_id,
-        max_retries=args.max_retries
+        max_retries=args.max_retries,
+        use_optimized=args.use_optimized,
+        use_ensemble=args.use_ensemble,
+        use_beam_search=args.use_beam_search,
+        use_optimization=args.use_optimization,
+        ensemble_size=args.ensemble_size,
+        beam_size=args.beam_size
     )
     
     # Save results
