@@ -4,7 +4,7 @@
 
 ### *Evaluating LLM Creativity as Set-Valued Hypothesis Generators under Underdetermination*
 
-[![Paper](https://img.shields.io/badge/📄_Paper-arXiv-b31b1b.svg)](https://arxiv.org)
+[![Paper](https://img.shields.io/badge/📄_Paper-arXiv-b31b1b.svg)](https://arxiv.org/abs/2510.15614)
 [![Python](https://img.shields.io/badge/Python-3.8+-3776AB.svg?logo=python&logoColor=white)](https://www.python.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
@@ -312,10 +312,10 @@ Results are automatically saved as JSON files in the `results/` directory.
 If you use HypoSpace in your research, please cite:
 
 ```bibtex
-@article{hypospace2025,
+@article{chen2025hypospace,
   title={HypoSpace: Evaluating LLM Creativity as Set-Valued Hypothesis Generators under Underdetermination},
-  author={Your Name and Collaborators},
-  journal={arXiv preprint arXiv:XXXX.XXXXX},
+  author={Chen, Tingting and Lin, Beibei and Yuan, Zifeng and Zou, Qiran and He, Hongyu and Ong, Yew-Soon and Goyal, Anirudh and Liu, Dianbo},
+  journal={arXiv preprint arXiv:2510.15614},
   year={2025}
 }
 ```
