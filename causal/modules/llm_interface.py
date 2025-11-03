@@ -52,6 +52,47 @@ def _extract_usage(resp):
 class LLMInterface(ABC):
     """Abstract interface for LLM interaction."""
     
+    def __init__(self, system_prompt_mode: str = "basic"):
+        """Initialize with system prompt mode."""
+        self.system_prompt_mode = system_prompt_mode
+    
+    def get_system_prompt(self) -> str:
+        """Get system prompt based on mode."""
+        if self.system_prompt_mode == "enhanced":
+            return """You are an expert in causal inference and graph theory with deep knowledge of:
+
+1. CAUSAL REASONING: You understand that causal relationships are directional (A→B means A causes B), and that correlation does not imply causation.
+
+2. GRAPH THEORY: You know that causal graphs must be acyclic (no cycles), and that each edge represents a direct causal relationship.
+
+3. EXPERIMENTAL DESIGN: You understand perturbation experiments where:
+   - Perturbing a node sets it to 0
+   - Downstream effects propagate to descendants (set to 1)
+   - Non-descendants remain unaffected (stay 0)
+
+4. LOGICAL CONSTRAINTS: You apply rigorous logical reasoning to:
+   - Identify necessary vs. sufficient conditions
+   - Distinguish direct vs. indirect effects
+   - Resolve conflicting evidence systematically
+
+5. OUTPUT PRECISION: You always follow exact formatting requirements and avoid speculation beyond what the evidence supports.
+
+Your goal is to infer the most parsimonious causal graph that explains all observations while respecting all constraints."""
+        
+        elif self.system_prompt_mode == "strict":
+            return """You are a precise causal inference specialist. Your core principles:
+
+REASONING: Use systematic logical deduction from perturbation experiments.
+EVIDENCE: Only propose edges strongly supported by multiple observations.
+CONSTRAINTS: Strictly respect acyclicity, edge limits, and node restrictions.
+FORMAT: Follow output contracts exactly - no deviations, no extra text.
+PARSIMONY: Prefer simpler explanations that account for all data.
+
+You excel at distinguishing correlation from causation and identifying the minimal sufficient causal structure."""
+        
+        else:  # basic mode
+            return "You are an expert in causal inference and graph theory."
+    
     @abstractmethod
     def query(self, prompt: str) -> str:
         """
@@ -102,7 +143,8 @@ class OpenRouterLLM(LLMInterface):
         api_key: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: int = 40960,
-        base_url: str = "https://openrouter.ai/api/v1"
+        base_url: str = "https://openrouter.ai/api/v1",
+        system_prompt_mode: str = "basic"
     ):
         """
         Initialize OpenRouter LLM interface.
@@ -113,7 +155,9 @@ class OpenRouterLLM(LLMInterface):
             temperature: Sampling temperature
             max_tokens: Maximum tokens in response
             base_url: OpenRouter API base URL
+            system_prompt_mode: System prompt mode ("basic", "enhanced", "strict")
         """
+        super().__init__(system_prompt_mode)
         if not api_key:
             raise ValueError("OpenRouter API key is required")
         
@@ -141,14 +185,14 @@ class OpenRouterLLM(LLMInterface):
             payload = {
                 "model": self.model,
                 "messages": [
-                    {"role": "system", "content": "You are an expert in causal inference and graph theory."},
+                    {"role": "system", "content": self.get_system_prompt()},
                     {"role": "user", "content": prompt}
                 ],
                 "temperature": self.temperature,
                 "max_tokens": self.max_tokens
             }
             
-            response = requests.post(url, headers=self.headers, json=payload)
+            response = requests.post(url, headers=self.headers, json=payload, timeout=30)
             response.raise_for_status()
             # print('result0',response)
             result = response.json()
@@ -216,7 +260,8 @@ class OpenAILLM(LLMInterface):
         model: str = "gpt-4",
         api_key: Optional[str] = None,
         temperature: float = 0.7,
-        max_tokens: int = 40960
+        max_tokens: int = 40960,
+        system_prompt_mode: str = "basic"
     ):
         """
         Initialize OpenAI LLM interface.
@@ -226,7 +271,9 @@ class OpenAILLM(LLMInterface):
             api_key: OpenAI API key (uses environment variable if not provided)
             temperature: Sampling temperature
             max_tokens: Maximum tokens in response
+            system_prompt_mode: System prompt mode ("basic", "enhanced", "strict")
         """
+        super().__init__(system_prompt_mode)
         try:
             import openai
         except ImportError:
@@ -255,7 +302,7 @@ class OpenAILLM(LLMInterface):
             resp = self.client.responses.create(
                 model=self.model,
                 input=[
-                    {"role": "system", "content": "You are an expert in causal inference and graph theory."},
+                    {"role": "system", "content": self.get_system_prompt()},
                     {"role": "user", "content": prompt},
                 ],
                 reasoning={"effort": "medium"},
@@ -313,7 +360,8 @@ class AnthropicLLM(LLMInterface):
         model: str = "claude-3-opus-20240229",
         api_key: Optional[str] = None,
         temperature: float = 0.7,
-        max_tokens: int = 500
+        max_tokens: int = 500,
+        system_prompt_mode: str = "basic"
     ):
         """
         Initialize Anthropic LLM interface.
@@ -323,7 +371,9 @@ class AnthropicLLM(LLMInterface):
             api_key: Anthropic API key (uses environment variable if not provided)
             temperature: Sampling temperature
             max_tokens: Maximum tokens in response
+            system_prompt_mode: System prompt mode ("basic", "enhanced", "strict")
         """
+        super().__init__(system_prompt_mode)
         try:
             import anthropic
         except ImportError:
@@ -347,6 +397,7 @@ class AnthropicLLM(LLMInterface):
                 model=self.model,
                 # max_tokens=self.max_tokens,
                 temperature=self.temperature,
+                system=self.get_system_prompt(),
                 messages=[
                     {"role": "user", "content": prompt}
                 ]
@@ -511,3 +562,86 @@ class ResponseParser:
                     edges.append((edge_match.group(1), edge_match.group(2)))
         
         return edges
+
+
+class DeepSeekLLM(LLMInterface):
+    """
+    DeepSeek API interface using OpenAI-compatible chat completions.
+    """
+    def __init__(
+        self,
+        model: str = "deepseek-chat",
+        api_key: Optional[str] = None,
+        temperature: float = 1.0,
+        max_tokens: int = 40960,
+        base_url: str = "https://api.deepseek.com/v1",
+        system_prompt_mode: str = "basic"
+    ):
+        super().__init__(system_prompt_mode)
+        if not api_key:
+            raise ValueError("DeepSeek API key is required")
+        self.model = model
+        self.api_key = api_key
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.base_url = base_url
+        self.headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+    def query(self, prompt: str) -> str:
+        result = self.query_with_usage(prompt)
+        return result["response"]
+
+    def query_with_usage(self, prompt: str) -> Dict[str, Any]:
+        try:
+            url = f"{self.base_url}/chat/completions"
+            payload = {
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": self.get_system_prompt()},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": self.temperature,
+            }
+            # Do not set max_tokens explicitly to avoid API 400 errors
+            response = requests.post(url, headers=self.headers, json=payload)
+            response.raise_for_status()
+            result = response.json()
+
+            usage = result.get("usage", {}) or {}
+            usage_data = {
+                "prompt_tokens": usage.get("prompt_tokens", 0),
+                "completion_tokens": usage.get("completion_tokens", 0),
+                "total_tokens": usage.get("total_tokens", usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)),
+            }
+            pricing = self.get_model_pricing()
+            cost = (usage_data["prompt_tokens"] * pricing["input"] + usage_data["completion_tokens"] * pricing["output"]) / 1_000_000
+
+            return {
+                "response": result["choices"][0]["message"]["content"],
+                "usage": usage_data,
+                "cost": cost,
+            }
+        except requests.exceptions.RequestException as e:
+            return {
+                "response": f"Error querying DeepSeek: {str(e)}",
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                "cost": 0.0,
+            }
+        except (KeyError, IndexError) as e:
+            return {
+                "response": f"Error parsing DeepSeek response: {str(e)}",
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                "cost": 0.0,
+            }
+
+    def get_name(self) -> str:
+        return f"DeepSeek({self.model})"
+
+    def get_model_pricing(self) -> Dict[str, float]:
+        # Approximate pricing per 1M tokens; adjust as needed
+        if "reasoner" in self.model or "r1" in self.model:
+            return {"input": 0.4, "output": 2.0}
+        return {"input": 0.14, "output": 0.28}

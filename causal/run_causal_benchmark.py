@@ -14,16 +14,10 @@ from textwrap import dedent
 from collections import Counter
 from scipy import stats
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from modules.models import CausalGraph
-from modules.causal_guidance import (
-    build_constraint_summary,
-    format_constraint_lines,
-    summarise_graph_bank,
-    format_edge_pattern_lines,
-    format_graph_string,
-)
-from modules.llm_interface import LLMInterface, OpenRouterLLM, OpenAILLM, AnthropicLLM
+from modules.llm_interface import LLMInterface, OpenRouterLLM, OpenAILLM, AnthropicLLM, DeepSeekLLM
 from generate_causal_dataset import PerturbationObservation, CausalDatasetGenerator
 
 class CausalBenchmarkEnhanced:
@@ -31,7 +25,9 @@ class CausalBenchmarkEnhanced:
     
     def __init__(self, complete_dataset_path: Optional[str] = None, 
                  n_observations_filter: Optional[List[int]] = None,
-                 gt_filter: Optional[Tuple] = None):
+                 gt_filter: Optional[Tuple] = None,
+                 prompt_mode: str = 'baseline',
+                 system_prompt_mode: str = 'basic'):
         """
         Initialize benchmark with a complete dataset or empty.
         
@@ -39,14 +35,15 @@ class CausalBenchmarkEnhanced:
             complete_dataset_path: Path to the complete causal dataset JSON file (optional)
             n_observations_filter: List of n_observations values to include (optional)
             gt_filter: Tuple of (min, max) for GT range or (list, None) for specific values (optional)
+            prompt_mode: Prompt strategy ('baseline', 'reasoned', or 'reasoned_strict')
+            system_prompt_mode: System prompt mode ('basic', 'enhanced', or 'strict')
         """
         self.n_observations_filter = n_observations_filter
         self.gt_filter = gt_filter
         self.filtered_observation_sets = []
         self.excluded_observation_sets = []  # For potential backfill
-        self._graph_bank_cache: Dict[Tuple, List[CausalGraph]] = {}
-        self._guidance_cache: Dict[Tuple, Dict[str, Any]] = {}
-        self._current_prompt_context: Optional[Dict[str, Any]] = None
+        self.prompt_mode = prompt_mode
+        self.system_prompt_mode = system_prompt_mode
         
         if complete_dataset_path:
             with open(complete_dataset_path, 'r') as f:
@@ -66,17 +63,6 @@ class CausalBenchmarkEnhanced:
                 self.all_observation_sets = self.complete_dataset['datasets']
             elif 'sampled_datasets' in self.complete_dataset:
                 self.all_observation_sets = self.complete_dataset['sampled_datasets']
-
-            graph_bank_temp: Dict[Tuple, Dict[str, CausalGraph]] = {}
-            for obs_set in self.all_observation_sets:
-                obs_key = self._make_obs_key(obs_set.get('observations', []))
-                if not obs_key:
-                    continue
-                bank = graph_bank_temp.setdefault(obs_key, {})
-                for gt_dict in obs_set.get('ground_truth_graphs', []):
-                    graph = CausalGraph.from_dict(gt_dict)
-                    bank[graph.get_hash()] = graph
-            self._graph_bank_cache = {k: list(bank.values()) for k, bank in graph_bank_temp.items()}
             
             # Apply two-stage filtering
             stage1_filtered = self.all_observation_sets
@@ -203,100 +189,11 @@ class CausalBenchmarkEnhanced:
         
         return sampled
     
-    @staticmethod
-    def _make_obs_key(observations: List[Dict]) -> Tuple:
-        """Create a hashable key describing an observation set."""
-        normalized = []
-        for obs in observations or []:
-            perturbed = obs.get('perturbed_node')
-            effects = obs.get('effects', {})
-            effect_items = tuple(sorted((node, int(val)) for node, val in effects.items()))
-            normalized.append((perturbed, effect_items))
-        normalized.sort(key=lambda x: x[0] or "")
-        return tuple(normalized)
-
-    def _prepare_prompt_guidance(
-        self,
-        observations: List[Dict],
-        prior_hypotheses: List[CausalGraph]
-    ) -> Tuple[Tuple, Dict[str, Any], Set[str], List[CausalGraph], List[CausalGraph]]:
-        """Compute constraint text and candidate graphs for the current prompt."""
-        obs_key = self._make_obs_key(observations)
-        guidance = self._guidance_cache.get(obs_key)
-
-        if guidance is None:
-            constraint_summary = build_constraint_summary(self.nodes, observations)
-            constraint_lines = format_constraint_lines(constraint_summary)
-            graph_bank = self._graph_bank_cache.get(obs_key, [])
-            edge_patterns = summarise_graph_bank(self.nodes, graph_bank)
-            guidance = {
-                'constraint_lines': constraint_lines,
-                'graph_bank': graph_bank,
-                'edge_patterns': edge_patterns,
-            }
-            self._guidance_cache[obs_key] = guidance
-
-        used_hashes = {h.get_hash() for h in prior_hypotheses}
-        graph_bank = guidance.get('graph_bank', [])
-        unused_graphs = [g for g in graph_bank if g.get_hash() not in used_hashes]
-
-        suggested_graphs: List[CausalGraph] = []
-        if graph_bank:
-            seen_hashes: Set[str] = set()
-            for graph in unused_graphs:
-                graph_hash = graph.get_hash()
-                if graph_hash in seen_hashes:
-                    continue
-                suggested_graphs.append(graph)
-                seen_hashes.add(graph_hash)
-                if len(suggested_graphs) >= 6:
-                    break
-            if len(suggested_graphs) < min(6, len(graph_bank)):
-                for graph in graph_bank:
-                    graph_hash = graph.get_hash()
-                    if graph_hash in seen_hashes:
-                        continue
-                    suggested_graphs.append(graph)
-                    seen_hashes.add(graph_hash)
-                    if len(suggested_graphs) >= 6:
-                        break
-
-        return obs_key, guidance, used_hashes, unused_graphs, suggested_graphs
-
     def create_prompt(self, observations: List[Dict], prior_hypotheses: List[CausalGraph]) -> str:
         """Create prompt for LLM."""
         nodes_str = ", ".join(self.nodes)
         obs_block = "\n".join(obs["string"] for obs in observations)
         
-        obs_key, guidance, used_hashes, unused_graphs, suggested_graphs = self._prepare_prompt_guidance(
-            observations, prior_hypotheses
-        )
-
-        constraint_lines = guidance.get('constraint_lines', [])
-        constraint_block = ""
-        if constraint_lines:
-            constraint_block = "\nConstraint insights derived from the dataset:"\
-                + "\n- " + "\n- ".join(constraint_lines)
-
-        edge_pattern_lines = format_edge_pattern_lines(guidance.get('edge_patterns', {}))
-        pattern_block = ""
-        if edge_pattern_lines:
-            pattern_block = "\nEdge orientation hints:" + "\n- " + "\n- ".join(edge_pattern_lines)
-
-        option_lines = []
-        option_map = {}
-        for idx, graph in enumerate(suggested_graphs, start=1):
-            option_lines.append(f"{idx}. {format_graph_string(graph)}")
-            option_map[idx] = graph
-
-        options_block = ""
-        if option_lines:
-            options_block = (
-                "\nValidated hypothesis bank (already consistent with all observations):\n"
-                + "\n".join(option_lines)
-                + "\nPrioritize unused candidates; if the list is exhausted, craft a new graph that still satisfies the constraints."
-            )
-
         if prior_hypotheses:
             prior_lines = []
             for h in prior_hypotheses:
@@ -314,7 +211,8 @@ class CausalBenchmarkEnhanced:
         if self.max_edges is not None:
             constraint_info = f"\nConstraint: The graph should have at most {self.max_edges} edges."
         
-        prompt = f"""
+        # Common header
+        header = f"""
         You are given observations from perturbation experiments on a causal system.
         
         Semantics:
@@ -329,46 +227,64 @@ class CausalBenchmarkEnhanced:
         
         Prior predictions (do not repeat if avoidable):
         {prior_block}
+        """.strip()
         
-        Task:
-        Output a single directed acyclic graph (DAG) over the nodes above that explains all observations.
+        # Output format requirement to align with parser
+        output_req = dedent(
+            """
+            Output requirement:
+            - Respond with a SINGLE LINE.
+            - The FIRST LINE must begin with: Graph:
+            - Use comma-separated edges in the form A->B.
+            - If no edges, respond exactly: Graph: No edges
+            - Do not include explanations or extra text besides the single line.
+            """
+        ).strip()
         
-        Diversity rule:
-        - A "diverse" graph is any valid graph whose edge set is NOT identical to any prior prediction.
-        - Generate diverse graphs when possible to explore the solution space.
-
-        Guidance:
-        - Follow the constraint insights and edge hints above.
-        - Copy one of the validated hypotheses that has not been used yet.
-        - If every candidate has been used, create a new DAG that still respects the constraints.
+        # Strict output contract to improve validity
+        output_req_strict = dedent(
+            f"""
+            Output Contract (STRICT):
+            - Produce EXACTLY ONE line starting with: Graph:
+            - After Graph:, list edges comma-separated using ONLY the provided node IDs.
+            - Edge pattern MUST be exactly: <Source>-><Target> (e.g., A->B)
+            - Use ONLY these node IDs: {", ".join(self.nodes)}
+            - NO self-loops (A->A), NO duplicate edges, NO cycles.
+            - If no edges, output EXACTLY: Graph: No edges
+            - Do NOT include code fences, quotes, JSON, bullets, or any text after the line.
+            - Edge count MUST NOT exceed {self.max_edges}.
+            """
+        ).strip()
         
-        Formatting rules:
-        1) Use only the listed nodes. No self-loops. No cycles.
-        2) Respond with exactly one line:
-        - If there are edges: Graph: A->B, B->C
-        - If there are no edges: Graph: No edges
-        """
-        prompt = dedent(prompt).strip()
-
-        prompt_sections = [prompt]
-        if constraint_block:
-            prompt_sections.append(constraint_block)
-        if pattern_block:
-            prompt_sections.append(pattern_block)
-        if options_block:
-            prompt_sections.append(options_block)
-
-        final_prompt = "\n\n".join(section.strip() for section in prompt_sections if section.strip())
-
-        self._current_prompt_context = {
-            'observation_key': obs_key,
-            'option_map': option_map,
-            'graph_bank': guidance.get('graph_bank', []),
-            'unused_graphs': unused_graphs,
-            'used_hashes': used_hashes,
-        }
-
-        return final_prompt
+        if getattr(self, 'prompt_mode', 'baseline') == 'reasoned_strict':
+            reasoning = dedent(
+                """
+                Reasoning (do NOT include reasoning in the final output):
+                1) From each observation, identify downstream nodes relative to the perturbed node.
+                2) Intersect constraints across observations to infer allowed parent-child relations.
+                3) Propose an acyclic directed graph respecting all constraints and the edge limit.
+                4) Prefer edges supported by multiple observations; avoid speculative edges.
+                5) Avoid repeating prior predictions unless strongly supported.
+                6) Finally, output ONLY the single Graph: line per the STRICT contract.
+                """
+            ).strip()
+            prompt = f"{header}\n\n{reasoning}\n\n{output_req_strict}"
+        elif getattr(self, 'prompt_mode', 'baseline') == 'reasoned':
+            reasoning = dedent(
+                """
+                Approach:
+                1) For each observation, list which nodes must be downstream of the perturbed node.
+                2) Combine constraints across observations to infer allowed parent-child relations.
+                3) Propose an acyclic directed graph consistent with all observations and constraints.
+                4) Respect edge limit if provided and avoid repeating prior predictions.
+                5) Finally, output the graph in the required single-line format.
+                """
+            ).strip()
+            prompt = f"{header}\n\n{reasoning}\n\n{output_req}"
+        else:
+            prompt = f"{header}\n\n{output_req}"
+        
+        return prompt
     
     def parse_llm_response(self, response: str) -> Optional[CausalGraph]:
         """Parse LLM response to extract causal graph."""
@@ -377,31 +293,13 @@ class CausalBenchmarkEnhanced:
         
         # Strip code fences and whitespace
         s = response.replace("```", "").strip()
-
-        context = getattr(self, '_current_prompt_context', None)
         
         # Look for "Graph:" line
         m = re.search(r'(?i)\bgraph\s*:\s*(.+)$', s, flags=re.MULTILINE)
         line = m.group(1).strip() if m else (s.splitlines()[0].strip() if s.splitlines() else "")
         if not line:
-            if context:
-                fallback_list = context.get('unused_graphs') or context.get('graph_bank') or []
-                if fallback_list:
-                    return fallback_list[0]
             return None
         
-        option_graph = None
-        if context:
-            option_match = re.search(r'(?:option|选项)\s*(\d+)', s, re.IGNORECASE)
-            if option_match:
-                try:
-                    idx = int(option_match.group(1))
-                    option_graph = context.get('option_map', {}).get(idx)
-                except ValueError:
-                    option_graph = None
-            if option_graph:
-                return option_graph
-
         # Clean up the line
         if (line.startswith('"') and line.endswith('"')) or (line.startswith("'") and line.endswith("'")):
             line = line[1:-1].strip()
@@ -410,7 +308,6 @@ class CausalBenchmarkEnhanced:
                 .replace("-->", "->")
                 .replace("=>", "->")
                 .rstrip(" .;"))
-        line = re.sub(r'(?i)(?:option|选项)\s*\d+', '', line).strip()
         
         # Handle "No edges"
         if re.search(r'\b(no\s+edges?|empty|none|null)\b', line, re.I):
@@ -419,27 +316,15 @@ class CausalBenchmarkEnhanced:
         # Parse edges
         parts = [p.strip() for p in line.split(",") if p.strip()]
         if not parts:
-            if context:
-                fallback_list = context.get('unused_graphs') or context.get('graph_bank') or []
-                if fallback_list:
-                    return fallback_list[0]
             return None
         
         edges = []
         for part in parts:
             m = re.fullmatch(r'([A-Za-z0-9_]+)\s*->\s*([A-Za-z0-9_]+)', part)
             if not m:
-                if context:
-                    fallback_list = context.get('unused_graphs') or context.get('graph_bank') or []
-                    if fallback_list:
-                        return fallback_list[0]
                 return None
             u, v = m.group(1), m.group(2)
             if u not in self.nodes or v not in self.nodes or u == v:
-                if context:
-                    fallback_list = context.get('unused_graphs') or context.get('graph_bank') or []
-                    if fallback_list:
-                        return fallback_list[0]
                 return None
             edges.append((u, v))
         
@@ -455,22 +340,9 @@ class CausalBenchmarkEnhanced:
         G.add_nodes_from(self.nodes)
         G.add_edges_from(edges)
         if not nx.is_directed_acyclic_graph(G):
-            if context:
-                fallback_list = context.get('unused_graphs') or context.get('graph_bank') or []
-                if fallback_list:
-                    return fallback_list[0]
             return None
-
-        hypothesis = CausalGraph(nodes=self.nodes, edges=edges)
-
-        if context:
-            used_hashes = context.get('used_hashes', set())
-            if hypothesis.get_hash() in used_hashes:
-                replacements = context.get('unused_graphs') or []
-                if replacements:
-                    hypothesis = replacements[0]
-
-        return hypothesis
+        
+        return CausalGraph(nodes=self.nodes, edges=edges)
     
     def validate_hypothesis(self, hypothesis: CausalGraph, observations: List[Dict]) -> bool:
         """Check if hypothesis is consistent with observations."""
@@ -528,7 +400,8 @@ class CausalBenchmarkEnhanced:
         observation_set: Dict,
         n_queries: int = 10,
         verbose: bool = True,
-        max_retries: int = 5
+        max_retries: int = 5,
+        concurrency: int = 1
     ) -> Dict:
         """
         Evaluate LLM on a single observation set with enhanced tracking.
@@ -559,86 +432,92 @@ class CausalBenchmarkEnhanced:
         total_completion_tokens = 0
         total_tokens = 0
         total_cost = 0.0
+        total_queries = 0
         
         # Error tracking
         errors = []
         error_counts = {}
         
-        for i in range(n_queries):
-            prompt = self.create_prompt(observations, all_hypotheses)
-            
-            # Try to get a valid response
-            hypothesis = None
-            query_error = None
-            
+        # Helper to run a single query with retries
+        def _run_query(idx: int, prompt: str):
+            local_usage = {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0}
+            local_cost = 0.0
+            last_error = None
             for attempt in range(max_retries):
                 try:
-                    # Use query_with_usage if available
                     if hasattr(llm, 'query_with_usage'):
                         result = llm.query_with_usage(prompt)
                         response = result['response']
-                        
-                        # Track usage
                         usage = result.get('usage', {})
-                        total_prompt_tokens += usage.get('prompt_tokens', 0)
-                        total_completion_tokens += usage.get('completion_tokens', 0)
-                        total_tokens += usage.get('total_tokens', 0)
-                        total_cost += result.get('cost', 0.0)
+                        local_usage['prompt_tokens'] += usage.get('prompt_tokens', 0)
+                        local_usage['completion_tokens'] += usage.get('completion_tokens', 0)
+                        local_usage['total_tokens'] += usage.get('total_tokens', 0)
+                        local_cost += result.get('cost', 0.0)
                     else:
                         response = llm.query(prompt)
-                    
-                    # Check if response is an error
                     if response and response.startswith("Error querying"):
-                        query_error = {
-                            'query_index': i,
+                        last_error = {
+                            'query_index': idx,
                             'attempt': attempt + 1,
                             'error_message': response,
                             'error_type': self._classify_error(response)
                         }
-                        error_type = query_error['error_type']
+                        error_type = last_error['error_type']
                         error_counts[error_type] = error_counts.get(error_type, 0) + 1
                         continue
-                    
-                    # Parse response
                     hypothesis = self.parse_llm_response(response)
                     if hypothesis:
-                        parse_success_count += 1
-                        break
-                        
+                        return {'hypothesis': hypothesis, 'usage': local_usage, 'cost': local_cost}
                 except Exception as e:
-                    query_error = {
-                        'query_index': i,
+                    last_error = {
+                        'query_index': idx,
                         'attempt': attempt + 1,
                         'error_message': str(e),
                         'error_type': self._classify_error(str(e))
                     }
                     if verbose:
-                        print(f"  ⚠ Exception on query {i + 1}: {str(e)[:100]}")
-            
-            # Record error if all attempts failed
-            if not hypothesis and query_error:
-                errors.append(query_error)
-            
-            if hypothesis:
-                all_hypotheses.append(hypothesis)
-                
-                # Check uniqueness among ALL hypotheses (for novelty calculation)
-                all_h_hash = hypothesis.get_hash()
-                if all_h_hash not in all_unique_hashes:
-                    all_unique_hashes.add(all_h_hash)
-                    unique_all_graphs.append(hypothesis)
-                
-                # Validate hypothesis
-                is_valid = self.validate_hypothesis(hypothesis, observations)
-                
-                if is_valid:
-                    valid_hypotheses.append(hypothesis)
-                    
-                    # Check uniqueness among valid hypotheses
-                    h_hash = hypothesis.get_hash()
-                    if h_hash not in unique_hashes:
-                        unique_hashes.add(h_hash)
-                        unique_valid_graphs.append(hypothesis)
+                        print(f"  ⚠ Exception on query {idx + 1}: {str(e)[:100]}")
+            return {'error': last_error, 'usage': local_usage, 'cost': local_cost}
+
+        # Batched concurrent execution
+        i = 0
+        while i < n_queries:
+            batch_size = min(concurrency if concurrency and concurrency > 0 else 1, n_queries - i)
+            prompt = self.create_prompt(observations, all_hypotheses)
+            futures = []
+            with ThreadPoolExecutor(max_workers=batch_size) as executor:
+                for j in range(batch_size):
+                    futures.append(executor.submit(_run_query, i + j, prompt))
+                for fut in futures:
+                    res = fut.result()
+                    # accumulate usage and cost
+                    u = res.get('usage', {})
+                    total_prompt_tokens += u.get('prompt_tokens', 0)
+                    total_completion_tokens += u.get('completion_tokens', 0)
+                    total_tokens += u.get('total_tokens', 0)
+                    total_cost += res.get('cost', 0.0)
+
+                    if 'error' in res and res['error']:
+                        errors.append(res['error'])
+                        continue
+                    hypothesis = res.get('hypothesis')
+                    if hypothesis:
+                        parse_success_count += 1
+                        all_hypotheses.append(hypothesis)
+                        # Novelty across all
+                        all_h_hash = hypothesis.get_hash()
+                        if all_h_hash not in all_unique_hashes:
+                            all_unique_hashes.add(all_h_hash)
+                            unique_all_graphs.append(hypothesis)
+                        # Validate
+                        is_valid = self.validate_hypothesis(hypothesis, observations)
+                        if is_valid:
+                            valid_hypotheses.append(hypothesis)
+                            h_hash = hypothesis.get_hash()
+                            if h_hash not in unique_hashes:
+                                unique_hashes.add(h_hash)
+                                unique_valid_graphs.append(hypothesis)
+            i += batch_size
         
         # Calculate metrics
         valid_rate = len(valid_hypotheses) / n_queries if n_queries > 0 else 0
@@ -692,7 +571,8 @@ class CausalBenchmarkEnhanced:
         seed: Optional[int] = None,
         verbose: bool = True,
         checkpoint_dir: str = "checkpoints",
-        max_retries: int = 3
+        max_retries: int = 3,
+        concurrency: int = 1
     ) -> Dict:
         """
         Run the enhanced benchmark with comprehensive tracking.
@@ -727,6 +607,7 @@ class CausalBenchmarkEnhanced:
         else:
             print(f"Queries per sample: {query_multiplier}x number of ground truths (adaptive)")
         print(f"Max retries: {max_retries}")
+        print(f"Concurrency: {concurrency}")
         print(f"Checkpoint file: {checkpoint_file}")
         print("-" * 50)
         
@@ -745,6 +626,7 @@ class CausalBenchmarkEnhanced:
         total_completion_tokens = 0
         total_tokens = 0
         total_cost = 0.0
+        total_queries = 0
         
         # Error tracking
         all_errors = []
@@ -803,7 +685,7 @@ class CausalBenchmarkEnhanced:
                 
                 # Evaluate
                 result = self.evaluate_single_observation_set(
-                    llm, obs_set, n_queries, verbose=False, max_retries=max_retries
+                    llm, obs_set, n_queries, verbose=False, max_retries=max_retries, concurrency=concurrency
                 )
                 
                 all_results.append(result)
@@ -819,6 +701,9 @@ class CausalBenchmarkEnhanced:
                     total_tokens += result['token_usage']['total_tokens']
                 if 'cost' in result:
                     total_cost += result['cost']
+                
+                # Track total queries
+                total_queries += result.get('n_queries', 0)
                 
                 # Aggregate errors
                 if 'errors' in result and result['errors']:
@@ -915,17 +800,18 @@ class CausalBenchmarkEnhanced:
                 'completion_tokens': total_completion_tokens,
                 'total_tokens': total_tokens,
                 'avg_tokens_per_sample': total_tokens / len(all_results) if all_results else 0,
-                'avg_tokens_per_query': total_tokens / (len(all_results) * (n_queries_per_sample or 1)) if all_results else 0
+                'avg_tokens_per_query': total_tokens / total_queries if total_queries > 0 else 0,
+                'total_queries': total_queries
             },
             'cost': {
                 'total_cost': total_cost,
                 'avg_cost_per_sample': total_cost / len(all_results) if all_results else 0,
-                'avg_cost_per_query': total_cost / (len(all_results) * (n_queries_per_sample or 1)) if all_results else 0
+                'avg_cost_per_query': total_cost / total_queries if total_queries > 0 else 0
             },
             'error_summary': {
                 'total_errors': len(all_errors),
                 'error_types': total_error_counts,
-                'error_rate': len(all_errors) / (len(all_results) * (n_queries_per_sample or 1)) if all_results else 0
+                'error_rate': (len(all_errors) / total_queries) if total_queries > 0 else 0
             },
             'per_sample_results': all_results
         }
@@ -949,14 +835,14 @@ class CausalBenchmarkEnhanced:
             if stats_dict['p_value'] is not None:
                 print(f"  p-value: {stats_dict['p_value']:.4f}")
         
-        print(f"\nToken Usage:")
+        print("\nToken Usage:")
         print(f"  Total tokens: {total_tokens:,}")
         print(f"  Prompt tokens: {total_prompt_tokens:,}")
         print(f"  Completion tokens: {total_completion_tokens:,}")
         print(f"  Avg tokens/sample: {final_results['token_usage']['avg_tokens_per_sample']:.1f}")
         print(f"  Avg tokens/query: {final_results['token_usage']['avg_tokens_per_query']:.1f}")
         
-        print(f"\nCost:")
+        print("\nCost:")
         print(f"  Total cost: ${total_cost:.4f}")
         print(f"  Avg cost/sample: ${final_results['cost']['avg_cost_per_sample']:.4f}")
         print(f"  Avg cost/query: ${final_results['cost']['avg_cost_per_query']:.6f}")
@@ -986,6 +872,8 @@ class CausalBenchmarkEnhanced:
 def setup_llm(llm_type: str, **kwargs) -> LLMInterface:
     """Set up the LLM interface based on type."""
     
+    system_prompt_mode = kwargs.get('system_prompt_mode', 'basic')
+    
     if llm_type == "openai":
         api_key = kwargs.get('api_key') or os.environ.get('OPENAI_API_KEY')
         if not api_key:
@@ -994,7 +882,8 @@ def setup_llm(llm_type: str, **kwargs) -> LLMInterface:
         return OpenAILLM(
             model=kwargs.get('model', 'gpt-4o'),
             api_key=api_key,
-            temperature=kwargs.get('temperature', 0.7)
+            temperature=kwargs.get('temperature', 0.7),
+            system_prompt_mode=system_prompt_mode
         )
     
     elif llm_type == "anthropic":
@@ -1005,18 +894,30 @@ def setup_llm(llm_type: str, **kwargs) -> LLMInterface:
         return AnthropicLLM(
             model=kwargs.get('model', 'claude-3-opus-20240229'),
             api_key=api_key,
-            temperature=kwargs.get('temperature', 0.7)
+            temperature=kwargs.get('temperature', 0.7),
+            system_prompt_mode=system_prompt_mode
         )
     
     elif llm_type == "openrouter":
         api_key = kwargs.get('api_key') or os.environ.get('OPENROUTER_API_KEY')
         if not api_key:
             raise ValueError("OpenRouter API key required")
-        
         return OpenRouterLLM(
             model=kwargs.get('model', 'anthropic/claude-3.5-sonnet'),
             api_key=api_key,
-            temperature=kwargs.get('temperature', 0.7)
+            temperature=kwargs.get('temperature', 0.7),
+            system_prompt_mode=system_prompt_mode
+        )
+    
+    elif llm_type == "deepseek":
+        api_key = kwargs.get('api_key') or os.environ.get('DEEPSEEK_API_KEY')
+        if not api_key:
+            raise ValueError("DeepSeek API key required")
+        return DeepSeekLLM(
+            model=kwargs.get('model', 'deepseek-chat'),
+            api_key=api_key,
+            temperature=kwargs.get('temperature', 1.0),
+            system_prompt_mode=system_prompt_mode
         )
     
     else:
@@ -1116,9 +1017,12 @@ def main():
     parser.add_argument("--n-queries", type=int, default=None, help="Fixed number of queries per observation set")
     parser.add_argument("--query-multiplier", type=float, default=2.0, help="Multiplier for adaptive queries")
     parser.add_argument("--max-retries", type=int, default=3, help="Maximum retries per query")
+    parser.add_argument("--concurrency", type=int, default=1, help="Concurrent queries per observation set")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for sampling")
     parser.add_argument("--checkpoint-dir", default="checkpoints", help="Directory for checkpoints")
     parser.add_argument("--output", default=None, help="Output file path")
+    parser.add_argument("--prompt-mode", choices=["baseline", "reasoned", "reasoned_strict"], default="baseline", help="Prompt strategy")
+    parser.add_argument("--system-prompt-mode", choices=["basic", "enhanced", "strict"], default="basic", help="System prompt mode")
     parser.add_argument("--verbose", action="store_true", default=True, help="Verbose output")
     parser.add_argument("--quiet", action="store_true", help="Disable verbose output")
     
@@ -1137,7 +1041,8 @@ def main():
         default_models = {
             'openrouter': 'openai/gpt-3.5-turbo',
             'openai': 'gpt-4o',
-            'anthropic': 'claude-3-opus-20240229'
+            'anthropic': 'claude-3-opus-20240229',
+            'deepseek': 'deepseek-chat'
         }
         model = default_models.get(llm_type)
     
@@ -1146,7 +1051,8 @@ def main():
         env_vars = {
             'openai': 'OPENAI_API_KEY',
             'anthropic': 'ANTHROPIC_API_KEY',
-            'openrouter': 'OPENROUTER_API_KEY'
+            'openrouter': 'OPENROUTER_API_KEY',
+            'deepseek': 'DEEPSEEK_API_KEY'
         }
         if llm_type in env_vars:
             api_key = os.environ.get(env_vars[llm_type])
@@ -1163,8 +1069,26 @@ def main():
     if args.output is None:
         dataset_name = Path(args.dataset).stem
         model_name = Path(model).stem if model else llm_type
-        output_pattern = config.get('benchmark', {}).get("output_pattern", "results/{dataset_name}_{model}.json")
-        output = output_pattern.format(dataset_name=dataset_name,model=model_name)
+
+        def fmt_float(x: float) -> str:
+            s = f"{x}".replace(".", "p")
+            return s
+
+        # Build query tag: fixed number or multiplier
+        if args.n_queries is not None:
+            query_tag = f"q{args.n_queries}"
+        else:
+            query_tag = f"q{fmt_float(args.query_multiplier)}x"
+        # Other tags
+        seed_tag = f"seed{args.seed}" if args.seed is not None else "seedNA"
+        temp_tag = f"temp{fmt_float(temperature)}"
+        pm_tag = args.prompt_mode
+        sys_tag = f"sys{args.system_prompt_mode}"
+        conc_tag = f"c{args.concurrency}"
+        retry_tag = f"r{args.max_retries}"
+
+        # Auto filename includes key parameters (include system prompt mode)
+        output = f"results/{dataset_name}_{model_name}_{pm_tag}_{sys_tag}_{query_tag}_{seed_tag}_{temp_tag}_{conc_tag}_{retry_tag}.json"
     else:
         output = args.output
     
@@ -1186,7 +1110,9 @@ def main():
     # Initialize benchmark with filters
     benchmark = CausalBenchmarkEnhanced(args.dataset, 
                                        n_observations_filter=n_observations_filter,
-                                       gt_filter=gt_filter)
+                                       gt_filter=gt_filter,
+                                       prompt_mode=args.prompt_mode,
+                                       system_prompt_mode=args.system_prompt_mode)
     
     # Print configuration
     print("\n" + "=" * 60)
@@ -1204,6 +1130,9 @@ def main():
         print(f"Queries per sample: {args.query_multiplier}x ground truths (adaptive)")
     
     print(f"Max retries: {args.max_retries}")
+    print(f"Concurrency: {args.concurrency}")
+    print(f"Prompt mode: {args.prompt_mode}")
+    print(f"System prompt mode: {args.system_prompt_mode}")
     print(f"Seed: {args.seed}")
     print(f"Checkpoint dir: {checkpoint_dir}")
     print(f"Output: {output}")
@@ -1214,7 +1143,8 @@ def main():
         llm_type,
         model=model,
         api_key=api_key,
-        temperature=temperature
+        temperature=temperature,
+        system_prompt_mode=args.system_prompt_mode
     )
     
     # Run benchmark
@@ -1226,7 +1156,8 @@ def main():
         seed=args.seed,
         verbose=verbose,
         checkpoint_dir=checkpoint_dir,
-        max_retries=args.max_retries
+        max_retries=args.max_retries,
+        concurrency=args.concurrency
     )
     
     # Save final results
