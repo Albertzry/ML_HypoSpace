@@ -141,7 +141,14 @@ class OpenRouterLLM(LLMInterface):
             payload = {
                 "model": self.model,
                 "messages": [
-                    {"role": "system", "content": "You are an expert in causal inference and graph theory."},
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are an expert in boolean logic discovery. "
+                            "Given partial truth tables, you craft concise boolean expressions that satisfy "
+                            "all provided observations while exploring structurally diverse hypotheses."
+                        ),
+                    },
                     {"role": "user", "content": prompt}
                 ],
                 "temperature": self.temperature,
@@ -255,7 +262,14 @@ class OpenAILLM(LLMInterface):
             resp = self.client.responses.create(
                 model=self.model,
                 input=[
-                    {"role": "system", "content": "You are an expert in causal inference and graph theory."},
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are an expert in boolean logic discovery. "
+                            "Use the observations to propose structurally diverse boolean expressions "
+                            "that exactly match every provided input-output pair."
+                        ),
+                    },
                     {"role": "user", "content": prompt},
                 ],
                 reasoning={"effort": "medium"},

@@ -9,12 +9,13 @@ import numpy as np
 import ast
 import sympy as sp
 from pathlib import Path
-from typing import List, Dict, Set, Tuple, Optional
+from typing import List, Dict, Set, Tuple, Optional, Any
 from datetime import datetime
 from textwrap import dedent
 from collections import Counter
 from scipy import stats
 import traceback
+from itertools import product
 
 # Add parent directory to path if needed
 sys.path.append(str(Path(__file__).parent))
@@ -76,146 +77,196 @@ class BooleanBenchmarkRefined:
         sampled = random.sample(self.all_observation_sets, n_to_sample)
         return sampled
 
-    def create_prompt(self, observations: List[BooleanObservation], 
-                     prior_hypotheses: List[str]) -> str:
-        # Build obs_block, prior_block, operators_str ...
-                # Format observations
-        obs_lines = []
-        for obs in observations:
-            obs_lines.append(obs.to_string())
-        obs_block = "\n".join(obs_lines)
-        
-        # Format prior hypotheses
-        if prior_hypotheses:
-            prior_block = "\n".join([f"Expression: {h}" for h in prior_hypotheses])
+    def create_prompt(
+        self,
+        observations: List[BooleanObservation],
+        prior_attempts: List[Dict[str, Any]],
+        recovered_stats: Optional[Dict[str, int]] = None
+    ) -> str:
+        """Build a structured prompt with explicit feedback for the LLM."""
+        obs_lines = [obs.to_string() for obs in observations]
+        if obs_lines:
+            obs_block = "        " + "\n        ".join(obs_lines)
         else:
-            prior_block = "None"
-        
-        # Build operator description
-        op_descriptions = []
-        if 'AND' in self.operators: op_descriptions.append("AND (conjunction)")
-        if 'OR'  in self.operators: op_descriptions.append("OR (disjunction)")
-        if 'NOT' in self.operators: op_descriptions.append("NOT (negation)")
-        if 'XOR' in self.operators: op_descriptions.append("XOR (exclusive or)")
-        if 'NOR' in self.operators: op_descriptions.append("NOR (NOT (x OR y))")
-        
-        operators_str = ", ".join(op_descriptions)
+            obs_block = "        (no observations provided)"
 
-        # Pull mechanistic opts from the loaded dataset
+        if prior_attempts:
+            history_lines: List[str] = []
+            for attempt in prior_attempts:
+                if isinstance(attempt, dict):
+                    idx = attempt.get('index', len(history_lines) + 1)
+                    status = attempt.get('status', 'unknown').upper()
+                    expr = attempt.get('expression') or attempt.get('raw_response') or '(no expression captured)'
+                    reason = attempt.get('reason')
+                    extras = []
+                    if attempt.get('duplicate'):
+                        extras.append('duplicate structure')
+                    if attempt.get('recovered'):
+                        extras.append('recovers ground truth')
+                    extra_text = f" ({'; '.join(extras)})" if extras else ''
+                    line = f"{idx}. [{status}] {expr}{extra_text}"
+                    if reason:
+                        line += f" -> {reason}"
+                    history_lines.append(line)
+                else:
+                    history_lines.append(str(attempt))
+            prior_block = "        " + "\n        ".join(history_lines)
+        else:
+            prior_block = "        (no previous attempts)"
+
+        op_descriptions = []
+        if 'AND' in self.operators:
+            op_descriptions.append('AND (conjunction)')
+        if 'OR' in self.operators:
+            op_descriptions.append('OR (disjunction)')
+        if 'NOT' in self.operators:
+            op_descriptions.append('NOT (negation)')
+        if 'XOR' in self.operators:
+            op_descriptions.append('XOR (exclusive or)')
+        if 'NOR' in self.operators:
+            op_descriptions.append('NOR (NOT (x OR y))')
+        operators_str = ', '.join(op_descriptions) if op_descriptions else '(no operators)'
+
         mech = self.complete_dataset.get('metadata', {}).get('mechanistic_opts', {})
         comm = mech.get('apply_commutativity', True)
         idem = mech.get('apply_idempotence_and_or', True)
         flat = mech.get('flatten_associativity', True)
 
-        eq_rules = []
+        eq_rules: List[str] = []
         if comm:
-            eq_rules.append(
-                "- Commutativity: reorderings are the SAME (e.g., x AND y = y AND x)."
-            )
+            eq_rules.append('- Commutativity: reorderings are the SAME (x AND y = y AND x).')
         if idem:
-            eq_rules.append(
-                "- Idempotence: duplicates of the same input under AND/OR collapse (e.g., x AND x = x; x OR x = x)."
-            )
+            eq_rules.append('- Idempotence: duplicates collapse (x AND x = x; x OR x = x).')
         if flat:
-            eq_rules.append(
-                "- Associativity flattening: cascades of the SAME operator are the SAME regardless of parentheses "
-                "(e.g., (x AND y) AND x = x AND (y AND x) = x AND x AND y)."
-            )
+            eq_rules.append('- Associativity flattening: cascades of the SAME operator are the SAME ((x AND y) AND x = x AND y AND x).')
         else:
-            eq_rules.append(
-                "- No associativity flattening: different parenthesizations of the SAME operator are DIFFERENT "
-                "(e.g., (x AND y) AND x ≠ x AND (y AND x))."
-            )
-
-        eq_rules.append(
-            "- No distributivity, absorption, or De Morgan normalization: mixing operators keeps expressions DIFFERENT "
-            "(e.g., (x AND y) OR z ≠ x AND (y OR z))."
-        )
-
+            eq_rules.append('- No associativity flattening: different parentheses produce DIFFERENT expressions.')
+        eq_rules.append('- No distributivity / absorption / De Morgan rewrites: mixed-operator forms stay DIFFERENT.')
         rules_text = "\n        ".join(eq_rules)
 
-        prompt = f"""You are given partial observations of a Boolean function with variables: {', '.join(self.variables)}
+        combos = list(product([0, 1], repeat=len(self.variables)))
+        combo_str = ', '.join(''.join(str(bit) for bit in combo) for combo in combos)
 
-            Allowed operators: {operators_str}
+        if recovered_stats:
+            total = recovered_stats.get('total', 0)
+            recovered = recovered_stats.get('recovered', 0)
+            if total:
+                remaining = max(total - recovered, 0)
+                recovered_text = f"{recovered}/{total} ground-truth structures covered; {remaining} still unrecovered."
+            else:
+                recovered_text = 'Ground-truth structure count unavailable.'
+        else:
+            recovered_text = 'No ground-truth structures recovered yet; seek a new candidate.'
 
-            Observations (input -> output):
-            {obs_block}
+        prompt = dedent(f"""
+        You are a boolean logic expert. Produce a hypothesis expression consistent with every observation and structurally novel relative to prior attempts.
 
-            Prior expressions generated (avoid repeating any expression 
-            that is equivalent under the rules below):
-            {prior_block}
+        Observations (input -> output):
+{obs_block}
 
-            Task: Generate a single Boolean expression that is consistent with ALL observations.
+        Previous attempts (status :: feedback):
+{prior_block}
 
-            Requirements:
-            1. Use ONLY the variables: {', '.join(self.variables)}
-            2. Use ONLY these operators: {', '.join(self.operators)}
-            3. The expression must match all given observations
-            4. Structural uniqueness is judged by these rules:
-            {rules_text}
-            5. Expression depth should be at most {self.max_depth} levels of nesting
-            6. Do not use boolean constants True or False anywhere in the expression.
+        Progress summary: {recovered_text}
 
-            Output format: 
-            - Return ONLY the Boolean expression on a single line
-            - Use plain text format (no LaTeX, no markdown, no special formatting)
-            - Use uppercase for operators. 
-            - Use lowercase for variables: x, y
-            - Use parentheses for grouping when needed
-            - Start your response with "Expression: " followed by the expression
-            
-            Examples of correct format:
-            Expression: x AND y
-            Expression: (x OR y) AND NOT x
-            Expression: NOT (x AND y)
-            Expression: NOR(x, y)
-            
-            DO NOT use formats like:
-            - \\(x \\land y\\)  (LaTeX)
-            - `x AND y`  (markdown)
-            - x ∧ y  (mathematical symbols)
-            """
+        Allowed variables: {', '.join(self.variables)}
+        Allowed operators: {operators_str}
+
+        Treat two expressions as equivalent only if all of the following apply:
+        {rules_text}
+
+        Workflow instructions:
+        1. Enumerate every input combination ({combo_str}) and make sure your expression matches the provided outputs before replying.
+        2. Do not repeat expressions that are equivalent to the history under the rules above.
+        3. Keep expression depth <= {self.max_depth} and do not use literal True/False constants.
+        4. If an attempt fails, self-correct and only share the corrected final answer.
+
+        Output format (plain text):
+        Expression: <final expression>
+        Truth table:
+          <inputs> -> <output>   # list all {len(combos)} combinations
+        Reasoning: <one sentence on why the expression fits and is novel>
+
+        Do not add extra sections beyond the three shown above.
+        """).strip()
         return prompt
-    
+
     def parse_llm_response(self, response: str) -> Optional[str]:
         """Parse LLM response to extract Boolean expression."""
         if not isinstance(response, str):
             return None
-        
+
         response = response.strip()
-        
+
         # Clean common formatting issues
         def clean_expression(expr: str) -> str:
-            # Remove LaTeX delimiters
-            expr = re.sub(r'\\[()\[\]]', '', expr)
+            expr = re.sub(r'\[()\[\]]', '', expr)
             expr = re.sub(r'\$+', '', expr)
-            
-            # Remove markdown backticks
             expr = expr.strip('`')
-            
-            # Convert LaTeX/math symbols to text
-            expr = expr.replace('\\land', 'AND')
-            expr = expr.replace('\\lor', 'OR')
-            expr = expr.replace('\\lnot', 'NOT')
-            expr = expr.replace('\\neg', 'NOT')
-            expr = expr.replace('\\wedge', 'AND')
-            expr = expr.replace('\\vee', 'OR')
-            expr = expr.replace('∧', 'AND')
-            expr = expr.replace('∨', 'OR')
-            expr = expr.replace('¬', 'NOT')
-            expr = expr.replace('⊕', 'XOR')
-            
-            # Remove \text{} wrappers
-            expr = re.sub(r'\\text\{([^}]+)\}', r'\1', expr)
-            
-            # Clean up extra spaces and symbols
-            expr = re.sub(r'\*+$', '', expr)  # Remove trailing asterisks
-            expr = expr.strip('"\'').rstrip('.,;')
-            
+            replacements = {
+                '\land': 'AND',
+                '\lor': 'OR',
+                '\lnot': 'NOT',
+                '\neg': 'NOT',
+                '\wedge': 'AND',
+                '\vee': 'OR',
+                '¬': 'NOT',
+            }
+            for src, dst in replacements.items():
+                expr = expr.replace(src, dst)
+            expr = re.sub(r'\text\{([^}]+)\}', r'\1', expr)
+            expr = re.sub(r'\*+$', '', expr)
+            expr = expr.strip("'\" ").rstrip('.,;:')
             return expr.strip()
-        
-        # Look for "Expression:" line
-        lines = response.split('\n')
+
+        # Attempt to parse JSON-style answers
+        possible_json_strings = [response]
+        fence_match = re.search(r"```(?:json)?\s*(.*?)```", response, re.DOTALL | re.IGNORECASE)
+        if fence_match:
+            possible_json_strings.append(fence_match.group(1).strip())
+        brace_match = re.search(r"\{.*\}", response, re.DOTALL)
+        if brace_match:
+            possible_json_strings.append(brace_match.group(0))
+
+        for candidate in possible_json_strings:
+            try:
+                parsed = json.loads(candidate)
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+            if isinstance(parsed, dict):
+                keys_to_try = ['expression', 'Expression', 'expr', 'final_expression', 'boolean_expression']
+                expr_value = None
+                for key in keys_to_try:
+                    if key in parsed:
+                        expr_value = parsed[key]
+                        break
+
+                if expr_value is None:
+                    for container_key in ['answer', 'result', 'data']:
+                        inner = parsed.get(container_key)
+                        if isinstance(inner, dict):
+                            for key in keys_to_try:
+                                if key in inner:
+                                    expr_value = inner[key]
+                                    break
+                        if expr_value is not None:
+                            break
+
+                if expr_value:
+                    cleaned = clean_expression(str(expr_value))
+                    if cleaned:
+                        return cleaned
+
+            elif isinstance(parsed, list):
+                for item in parsed:
+                    if isinstance(item, str):
+                        cleaned = clean_expression(item)
+                        if cleaned:
+                            return cleaned
+
+        # Look for explicit "Expression:" lines
+        lines = response.splitlines()
         for line in lines:
             if 'Expression:' in line or 'expression:' in line:
                 parts = re.split(r'[Ee]xpression:', line)
@@ -223,17 +274,17 @@ class BooleanBenchmarkRefined:
                     expr = clean_expression(parts[1])
                     if expr:
                         return expr
-        
-        # Fallback: try first non-empty line with operators
+
+        # Fallback: scan for the first line that resembles a boolean expression
         for line in lines:
-            line = line.strip()
-            if line and not line.startswith('#'):
-                cleaned = clean_expression(line)
-                if any(op in cleaned.upper() for op in ['AND','OR','NOT','XOR','NOR']):
-                    return cleaned
-                if all(c.isalnum() or c in '() ' for c in cleaned):
-                    return cleaned
-        
+            candidate = clean_expression(line.strip())
+            if not candidate:
+                continue
+            if any(op in candidate.upper() for op in ['AND', 'OR', 'NOT', 'XOR', 'NOR']):
+                return candidate
+            if all(c.isalnum() or c in '() ' for c in candidate):
+                return candidate
+
         return None
 
     def get_expression_mechanistic_key(self, expr_str: str) -> Optional[Tuple]:
@@ -323,43 +374,48 @@ class BooleanBenchmarkRefined:
                 stack.extend(node.args)
         return True
     
-    def validate_expression(self, expr_str: str, observations: List[BooleanObservation]) -> Tuple[bool, Optional[Dict]]:
+    def validate_expression(self, expr_str: str, observations: List[BooleanObservation]) -> Tuple[bool, Dict[str, Any]]:
         """Validate if expression is consistent with observations and meets constraints."""
+        info: Dict[str, Any] = {}
         try:
-            # Now create expression and validate
             expr = BooleanExpression(expr_str, self.variables, self.operators)
-            
-            # Check if expression uses only allowed variables
-            if expr.sympy_expr is not None:
-                allowed_symbols = {sp.symbols(v) for v in self.variables}
-                free_symbols = expr.sympy_expr.free_symbols
-                if not free_symbols.issubset(allowed_symbols):
-                    return False, None
-                
-                # Check operators using AST traversal
-                if not self._check_operators_in_ast(expr.sympy_expr, self.operators):
-                    return False, None
-                
-                # Disallow constants (True/False) to maintain consistent space
-                for node in sp.preorder_traversal(expr.sympy_expr):
-                    if isinstance(node, (sp.logic.boolalg.BooleanTrue, sp.logic.boolalg.BooleanFalse)):
-                        return False, None
-            
-            # Check expression depth using AST
-            if expr.sympy_expr is not None:
-                ast_depth = self._get_ast_depth(expr.sympy_expr)
-                if ast_depth > self.max_depth:
-                    return False, None
-            
-            # Check consistency with observations
+        except Exception as exc:
+            return False, {'reason': f'Failed to parse expression: {exc}'}
+
+        if expr.sympy_expr is None:
+            return False, {'reason': 'Expression could not be parsed into a symbolic form.'}
+
+        allowed_symbols = {sp.symbols(v) for v in self.variables}
+        free_symbols = expr.sympy_expr.free_symbols
+        if not free_symbols.issubset(allowed_symbols):
+            invalid_symbols = sorted({str(s) for s in free_symbols - allowed_symbols})
+            return False, {'reason': f'Uses unsupported variables: {", ".join(invalid_symbols)}'}
+
+        if not self._check_operators_in_ast(expr.sympy_expr, self.operators):
+            return False, {'reason': 'Uses operators outside the allowed set.'}
+
+        for node in sp.preorder_traversal(expr.sympy_expr):
+            if isinstance(node, (sp.logic.boolalg.BooleanTrue, sp.logic.boolalg.BooleanFalse)):
+                return False, {'reason': 'Contains boolean constants (True/False), which are not allowed.'}
+
+        ast_depth = self._get_ast_depth(expr.sympy_expr)
+        if ast_depth > self.max_depth:
+            return False, {'reason': f'Expression depth {ast_depth} exceeds allowed maximum of {self.max_depth}.'}
+
+        try:
             for obs in observations:
-                if expr.evaluate(obs.inputs) != obs.output:
-                    return False, None
-            
-            return True, expr.truth_table
-        except:
-            return False, None
-    
+                predicted = expr.evaluate(obs.inputs)
+                if predicted != obs.output:
+                    return False, {
+                        'reason': f'Mismatch for inputs {obs.inputs}: expected {obs.output}, got {predicted}.',
+                        'truth_table': expr.truth_table
+                    }
+        except Exception as exc:
+            return False, {'reason': f'Failed while evaluating expression: {exc}'}
+
+        info['truth_table'] = expr.truth_table
+        return True, info
+
     def _classify_error(self, error_message: str) -> str:
         """Classify the type of error from the error message with more detail."""
         if "Expecting value" in error_message:
@@ -427,18 +483,12 @@ class BooleanBenchmarkRefined:
         verbose: bool = True,
         max_retries: int = 5
     ) -> Dict:
-        """
-        Evaluate LLM on a single observation set.
-        
-        Returns:
-            Dictionary with evaluation results for this observation set
-        """
-        # Extract observations and ground truths
+        """Evaluate LLM on a single observation set."""
         observations = [
-            BooleanObservation(obs['inputs'], obs['output']) 
+            BooleanObservation(obs['inputs'], obs['output'])
             for obs in observation_set['observations']
         ]
-        
+
         ground_truth_expressions = observation_set['ground_truth_expressions']
         gt_truth_tables = []
         gt_mechanistic_keys = []
@@ -448,160 +498,220 @@ class BooleanBenchmarkRefined:
                 key_tuple = ast.literal_eval(key_str)
                 truth_table[key_tuple] = value
             gt_truth_tables.append(truth_table)
-            # Extract mechanistic key for structural comparison
             gt_mech_key = gt.get('mechanistic_key', None)
             if gt_mech_key:
-                # Convert string representation back to tuple if needed (safe parsing)
                 gt_mechanistic_keys.append(ast.literal_eval(gt_mech_key) if isinstance(gt_mech_key, str) else gt_mech_key)
-        
-        # Track results
-        all_hypotheses = []
-        valid_hypotheses = []
-        unique_mechanistic_keys = set()
-        unique_valid_expressions = []
-        all_unique_mechanistic_keys = set()
-        unique_all_expressions = []
+
+        all_hypotheses: List[str] = []
+        valid_hypotheses: List[str] = []
+        unique_mechanistic_keys: Set[Tuple] = set()
+        unique_valid_expressions: List[str] = []
+        all_unique_mechanistic_keys: Set[Tuple] = set()
+        unique_all_expressions: List[str] = []
+        attempt_history: List[Dict[str, Any]] = []
+        recovered_gt_mech_keys: Set[Tuple] = set()
+
         parse_success_count = 0
         in_space_count = 0
-        
-        # Track token usage and costs
+
         total_prompt_tokens = 0
         total_completion_tokens = 0
         total_tokens = 0
         total_cost = 0.0
-        
-        # Track errors
-        errors = []  # List of error details
-        error_counts = {}  # Count of each error type
-        
+
+        def stringify_truth_table(truth_table: Dict[Tuple, Any]) -> Dict[str, Any]:
+            """Convert tuple-keyed truth tables to JSON-serializable form."""
+            converted = {}
+            for key, value in truth_table.items():
+                if isinstance(key, tuple):
+                    key_str = "".join(str(bit) for bit in key)
+                else:
+                    key_str = str(key)
+                converted[key_str] = value
+            return converted
+
+        errors: List[Dict[str, Any]] = []
+        error_counts: Dict[str, int] = {}
+
         for i in range(n_queries):
-            prompt = self.create_prompt(observations, all_hypotheses)
-            
-            # Try to get a valid response
-            hypothesis_str = None
-            query_error = None
+            prompt = self.create_prompt(
+                observations,
+                attempt_history,
+                {
+                    'recovered': len(recovered_gt_mech_keys),
+                    'total': len(gt_mechanistic_keys)
+                }
+            )
+
+            hypothesis_str: Optional[str] = None
+            query_error: Optional[Dict[str, Any]] = None
+            last_response: Optional[str] = None
+
             for attempt in range(max_retries):
-                # Use query_with_usage if available
                 if hasattr(llm, 'query_with_usage'):
                     result = llm.query_with_usage(prompt)
                     response = result['response']
-                    # Track usage
-                    total_prompt_tokens += result['usage']['prompt_tokens']
-                    total_completion_tokens += result['usage']['completion_tokens']
-                    total_tokens += result['usage']['total_tokens']
+                    last_response = response if isinstance(response, str) else str(response)
+                    usage = result.get('usage', {})
+                    total_prompt_tokens += usage.get('prompt_tokens', 0)
+                    total_completion_tokens += usage.get('completion_tokens', 0)
+                    total_tokens += usage.get('total_tokens', 0)
                     total_cost += result.get('cost', 0.0)
                 else:
                     response = llm.query(prompt)
-                
-                # Check if response is an error
-                if response.startswith("Error querying"):
+                    last_response = response if isinstance(response, str) else str(response)
+
+                if isinstance(response, str) and response.startswith("Error querying"):
+                    error_type = self._classify_error(response)
                     query_error = {
                         'query_index': i,
                         'attempt': attempt + 1,
                         'error_message': response,
-                        'error_type': self._classify_error(response)
+                        'error_type': error_type
                     }
-                    # Track error type count
-                    error_type = query_error['error_type']
                     error_counts[error_type] = error_counts.get(error_type, 0) + 1
-                    continue  # Try again
-                
+                    continue
+
                 hypothesis_str = self.parse_llm_response(response)
                 if hypothesis_str:
                     break
-            
-            # If all attempts failed, record the error
-            if not hypothesis_str and query_error:
-                errors.append(query_error)
-                # Store detailed error info in all_hypotheses
-                error_detail = f"[ERROR after {max_retries} attempts] Type: {query_error['error_type']} | {query_error['error_message']}"
-                all_hypotheses.append(error_detail)
-            
-            elif hypothesis_str:  # Only if we got a valid hypothesis
-                parse_success_count += 1
-                all_hypotheses.append(hypothesis_str)
-                
-                # Only count novelty for in-space expressions
-                if self._in_space(hypothesis_str):
-                    in_space_count += 1
-                    
-                    # Check uniqueness among in-space hypotheses (for novelty calculation)
-                    all_mech_key = self.get_expression_mechanistic_key(hypothesis_str)
-                    if all_mech_key and all_mech_key not in all_unique_mechanistic_keys:
-                        all_unique_mechanistic_keys.add(all_mech_key)
-                        unique_all_expressions.append(hypothesis_str)
-                
-                # Validate expression against observations
-                is_valid, truth_table = self.validate_expression(hypothesis_str, observations)
-                
-                if is_valid:
-                    valid_hypotheses.append(hypothesis_str)
-                    
-                    # Check uniqueness among valid hypotheses
-                    mech_key = self.get_expression_mechanistic_key(hypothesis_str)
-                    if mech_key and mech_key not in unique_mechanistic_keys:
-                        unique_mechanistic_keys.add(mech_key)
-                        unique_valid_expressions.append(hypothesis_str)
-        
-        # Calculate metrics
+
+                query_error = {
+                    'query_index': i,
+                    'attempt': attempt + 1,
+                    'error_message': 'Unable to parse model output.',
+                    'error_type': 'parse_failure'
+                }
+
+            attempt_record: Dict[str, Any] = {
+                'index': len(attempt_history) + 1,
+                'expression': hypothesis_str,
+            }
+            if last_response:
+                attempt_record['raw_response'] = last_response[:500]
+
+            if not hypothesis_str:
+                if query_error:
+                    errors.append(query_error)
+                    attempt_record['status'] = query_error['error_type']
+                    attempt_record['reason'] = query_error['error_message']
+                else:
+                    attempt_record['status'] = 'parse_failure'
+                    attempt_record['reason'] = 'Unable to interpret model output.'
+                    error_counts['parse_failure'] = error_counts.get('parse_failure', 0) + 1
+                all_hypotheses.append(f"[ERROR] {attempt_record.get('reason', 'Unknown failure')}")
+                attempt_history.append(attempt_record)
+                continue
+
+            parse_success_count += 1
+
+            in_space = self._in_space(hypothesis_str)
+            is_valid, validation_info = self.validate_expression(hypothesis_str, observations)
+
+            if in_space:
+                in_space_count += 1
+                mech_key_all = self.get_expression_mechanistic_key(hypothesis_str)
+                if mech_key_all and mech_key_all not in all_unique_mechanistic_keys:
+                    all_unique_mechanistic_keys.add(mech_key_all)
+                    unique_all_expressions.append(hypothesis_str)
+            else:
+                attempt_record['status'] = 'out_of_space'
+                attempt_record['reason'] = validation_info.get('reason', 'Violates search-space constraints.') if isinstance(validation_info, dict) else 'Violates search-space constraints.'
+                all_hypotheses.append(f"[INVALID:SPACE] {hypothesis_str} :: {attempt_record['reason']}")
+                attempt_history.append(attempt_record)
+                continue
+
+            if not is_valid:
+                attempt_record['status'] = 'invalid'
+                attempt_record['reason'] = validation_info.get('reason', 'Failed to satisfy observations.')
+                if isinstance(validation_info, dict) and 'truth_table' in validation_info:
+                    attempt_record['truth_table'] = stringify_truth_table(validation_info['truth_table'])
+                all_hypotheses.append(f"[INVALID] {hypothesis_str} :: {attempt_record['reason']}")
+                attempt_history.append(attempt_record)
+                continue
+
+            attempt_record['status'] = 'valid'
+            attempt_record['reason'] = 'Matches all provided observations.'
+            if isinstance(validation_info, dict) and 'truth_table' in validation_info:
+                attempt_record['truth_table'] = stringify_truth_table(validation_info['truth_table'])
+
+            valid_hypotheses.append(hypothesis_str)
+
+            mech_key = self.get_expression_mechanistic_key(hypothesis_str)
+            duplicate_flag = False
+            if mech_key:
+                attempt_record['mechanistic_key'] = repr(mech_key)
+                if mech_key not in unique_mechanistic_keys:
+                    unique_mechanistic_keys.add(mech_key)
+                    unique_valid_expressions.append(hypothesis_str)
+                else:
+                    duplicate_flag = True
+
+                if mech_key in gt_mechanistic_keys:
+                    if mech_key not in recovered_gt_mech_keys:
+                        recovered_gt_mech_keys.add(mech_key)
+                        attempt_record['recovered'] = True
+                    else:
+                        attempt_record['recovered'] = False
+
+            attempt_record['duplicate'] = duplicate_flag
+            if duplicate_flag:
+                attempt_record['reason'] = attempt_record.get('reason', '') + ' (structure already seen)'
+                all_hypotheses.append(f"[VALID DUPLICATE] {hypothesis_str}")
+            else:
+                all_hypotheses.append(f"[VALID] {hypothesis_str}")
+
+            attempt_history.append(attempt_record)
+
         parse_success_rate = parse_success_count / n_queries if n_queries > 0 else 0
         in_space_rate = in_space_count / n_queries if n_queries > 0 else 0
         valid_rate = len(valid_hypotheses) / n_queries if n_queries > 0 else 0
         novelty_rate = len(unique_all_expressions) / n_queries if n_queries > 0 else 0
-        recovery_rate = 0
-        
-        # Check recovery against ground truths using mechanistic keys (structural matching)
+
         recovered_gts = set()
-        recovered_gt_keys = set()
-        
-        # Collect mechanistic keys of generated expressions
         generated_mech_keys = set()
         for expr in unique_valid_expressions:
             mech_key = self.get_expression_mechanistic_key(expr)
             if mech_key:
                 generated_mech_keys.add(mech_key)
-        
-        # Check which ground truths were recovered (structurally)
         for j, gt_key in enumerate(gt_mechanistic_keys):
             if gt_key in generated_mech_keys:
                 recovered_gts.add(j)
-                recovered_gt_keys.add(gt_key)
-        
+
         recovery_rate = len(recovered_gts) / len(gt_mechanistic_keys) if gt_mechanistic_keys else 0
-        
+
         return {
             'observation_set_id': observation_set['observation_set_id'],
             'n_observations': observation_set['n_observations'],
             'n_ground_truths': len(ground_truth_expressions),
             'n_queries': n_queries,
             'n_valid': len(valid_hypotheses),
-            'n_unique_valid': len(unique_valid_expressions),  # Unique among valid hypotheses
-            'n_unique_all': len(unique_all_expressions),  # Unique among in-space hypotheses
+            'n_unique_valid': len(unique_valid_expressions),
+            'n_unique_all': len(unique_all_expressions),
             'n_recovered_gts': len(recovered_gts),
-            'parse_success_rate': parse_success_rate,  # Diagnostic: how many parsed
-            'in_space_rate': in_space_rate,  # Diagnostic: how many met space constraints
+            'parse_success_rate': parse_success_rate,
+            'in_space_rate': in_space_rate,
             'valid_rate': valid_rate,
-            'novelty_rate': novelty_rate,  # Now using unique in-space / n_queries
+            'novelty_rate': novelty_rate,
             'recovery_rate': recovery_rate,
             'all_hypotheses': all_hypotheses,
             'valid_hypotheses': valid_hypotheses,
             'unique_valid_expressions': unique_valid_expressions,
             'unique_all_expressions': unique_all_expressions,
-            # Token usage and cost tracking
             'token_usage': {
                 'prompt_tokens': total_prompt_tokens,
                 'completion_tokens': total_completion_tokens,
                 'total_tokens': total_tokens
             },
             'cost': total_cost,
-            # Error tracking
+            'attempt_history': attempt_history,
             'errors': errors,
             'error_summary': {
                 'total_errors': len(errors),
                 'error_types': error_counts
             }
         }
-    
+
     def run_benchmark(
         self,
         llm: LLMInterface,
