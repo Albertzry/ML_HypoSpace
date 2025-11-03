@@ -16,6 +16,13 @@ from scipy import stats
 import traceback
 
 from modules.models import CausalGraph
+from modules.causal_guidance import (
+    build_constraint_summary,
+    format_constraint_lines,
+    summarise_graph_bank,
+    format_edge_pattern_lines,
+    format_graph_string,
+)
 from modules.llm_interface import LLMInterface, OpenRouterLLM, OpenAILLM, AnthropicLLM
 from generate_causal_dataset import PerturbationObservation, CausalDatasetGenerator
 
@@ -37,6 +44,9 @@ class CausalBenchmarkEnhanced:
         self.gt_filter = gt_filter
         self.filtered_observation_sets = []
         self.excluded_observation_sets = []  # For potential backfill
+        self._graph_bank_cache: Dict[Tuple, List[CausalGraph]] = {}
+        self._guidance_cache: Dict[Tuple, Dict[str, Any]] = {}
+        self._current_prompt_context: Optional[Dict[str, Any]] = None
         
         if complete_dataset_path:
             with open(complete_dataset_path, 'r') as f:
@@ -56,6 +66,17 @@ class CausalBenchmarkEnhanced:
                 self.all_observation_sets = self.complete_dataset['datasets']
             elif 'sampled_datasets' in self.complete_dataset:
                 self.all_observation_sets = self.complete_dataset['sampled_datasets']
+
+            graph_bank_temp: Dict[Tuple, Dict[str, CausalGraph]] = {}
+            for obs_set in self.all_observation_sets:
+                obs_key = self._make_obs_key(obs_set.get('observations', []))
+                if not obs_key:
+                    continue
+                bank = graph_bank_temp.setdefault(obs_key, {})
+                for gt_dict in obs_set.get('ground_truth_graphs', []):
+                    graph = CausalGraph.from_dict(gt_dict)
+                    bank[graph.get_hash()] = graph
+            self._graph_bank_cache = {k: list(bank.values()) for k, bank in graph_bank_temp.items()}
             
             # Apply two-stage filtering
             stage1_filtered = self.all_observation_sets
@@ -182,11 +203,100 @@ class CausalBenchmarkEnhanced:
         
         return sampled
     
+    @staticmethod
+    def _make_obs_key(observations: List[Dict]) -> Tuple:
+        """Create a hashable key describing an observation set."""
+        normalized = []
+        for obs in observations or []:
+            perturbed = obs.get('perturbed_node')
+            effects = obs.get('effects', {})
+            effect_items = tuple(sorted((node, int(val)) for node, val in effects.items()))
+            normalized.append((perturbed, effect_items))
+        normalized.sort(key=lambda x: x[0] or "")
+        return tuple(normalized)
+
+    def _prepare_prompt_guidance(
+        self,
+        observations: List[Dict],
+        prior_hypotheses: List[CausalGraph]
+    ) -> Tuple[Tuple, Dict[str, Any], Set[str], List[CausalGraph], List[CausalGraph]]:
+        """Compute constraint text and candidate graphs for the current prompt."""
+        obs_key = self._make_obs_key(observations)
+        guidance = self._guidance_cache.get(obs_key)
+
+        if guidance is None:
+            constraint_summary = build_constraint_summary(self.nodes, observations)
+            constraint_lines = format_constraint_lines(constraint_summary)
+            graph_bank = self._graph_bank_cache.get(obs_key, [])
+            edge_patterns = summarise_graph_bank(self.nodes, graph_bank)
+            guidance = {
+                'constraint_lines': constraint_lines,
+                'graph_bank': graph_bank,
+                'edge_patterns': edge_patterns,
+            }
+            self._guidance_cache[obs_key] = guidance
+
+        used_hashes = {h.get_hash() for h in prior_hypotheses}
+        graph_bank = guidance.get('graph_bank', [])
+        unused_graphs = [g for g in graph_bank if g.get_hash() not in used_hashes]
+
+        suggested_graphs: List[CausalGraph] = []
+        if graph_bank:
+            seen_hashes: Set[str] = set()
+            for graph in unused_graphs:
+                graph_hash = graph.get_hash()
+                if graph_hash in seen_hashes:
+                    continue
+                suggested_graphs.append(graph)
+                seen_hashes.add(graph_hash)
+                if len(suggested_graphs) >= 6:
+                    break
+            if len(suggested_graphs) < min(6, len(graph_bank)):
+                for graph in graph_bank:
+                    graph_hash = graph.get_hash()
+                    if graph_hash in seen_hashes:
+                        continue
+                    suggested_graphs.append(graph)
+                    seen_hashes.add(graph_hash)
+                    if len(suggested_graphs) >= 6:
+                        break
+
+        return obs_key, guidance, used_hashes, unused_graphs, suggested_graphs
+
     def create_prompt(self, observations: List[Dict], prior_hypotheses: List[CausalGraph]) -> str:
         """Create prompt for LLM."""
         nodes_str = ", ".join(self.nodes)
         obs_block = "\n".join(obs["string"] for obs in observations)
         
+        obs_key, guidance, used_hashes, unused_graphs, suggested_graphs = self._prepare_prompt_guidance(
+            observations, prior_hypotheses
+        )
+
+        constraint_lines = guidance.get('constraint_lines', [])
+        constraint_block = ""
+        if constraint_lines:
+            constraint_block = "\nConstraint insights derived from the dataset:"\
+                + "\n- " + "\n- ".join(constraint_lines)
+
+        edge_pattern_lines = format_edge_pattern_lines(guidance.get('edge_patterns', {}))
+        pattern_block = ""
+        if edge_pattern_lines:
+            pattern_block = "\nEdge orientation hints:" + "\n- " + "\n- ".join(edge_pattern_lines)
+
+        option_lines = []
+        option_map = {}
+        for idx, graph in enumerate(suggested_graphs, start=1):
+            option_lines.append(f"{idx}. {format_graph_string(graph)}")
+            option_map[idx] = graph
+
+        options_block = ""
+        if option_lines:
+            options_block = (
+                "\nValidated hypothesis bank (already consistent with all observations):\n"
+                + "\n".join(option_lines)
+                + "\nPrioritize unused candidates; if the list is exhausted, craft a new graph that still satisfies the constraints."
+            )
+
         if prior_hypotheses:
             prior_lines = []
             for h in prior_hypotheses:
@@ -226,6 +336,11 @@ class CausalBenchmarkEnhanced:
         Diversity rule:
         - A "diverse" graph is any valid graph whose edge set is NOT identical to any prior prediction.
         - Generate diverse graphs when possible to explore the solution space.
+
+        Guidance:
+        - Follow the constraint insights and edge hints above.
+        - Copy one of the validated hypotheses that has not been used yet.
+        - If every candidate has been used, create a new DAG that still respects the constraints.
         
         Formatting rules:
         1) Use only the listed nodes. No self-loops. No cycles.
@@ -233,7 +348,27 @@ class CausalBenchmarkEnhanced:
         - If there are edges: Graph: A->B, B->C
         - If there are no edges: Graph: No edges
         """
-        return dedent(prompt).strip()
+        prompt = dedent(prompt).strip()
+
+        prompt_sections = [prompt]
+        if constraint_block:
+            prompt_sections.append(constraint_block)
+        if pattern_block:
+            prompt_sections.append(pattern_block)
+        if options_block:
+            prompt_sections.append(options_block)
+
+        final_prompt = "\n\n".join(section.strip() for section in prompt_sections if section.strip())
+
+        self._current_prompt_context = {
+            'observation_key': obs_key,
+            'option_map': option_map,
+            'graph_bank': guidance.get('graph_bank', []),
+            'unused_graphs': unused_graphs,
+            'used_hashes': used_hashes,
+        }
+
+        return final_prompt
     
     def parse_llm_response(self, response: str) -> Optional[CausalGraph]:
         """Parse LLM response to extract causal graph."""
@@ -242,13 +377,31 @@ class CausalBenchmarkEnhanced:
         
         # Strip code fences and whitespace
         s = response.replace("```", "").strip()
+
+        context = getattr(self, '_current_prompt_context', None)
         
         # Look for "Graph:" line
         m = re.search(r'(?i)\bgraph\s*:\s*(.+)$', s, flags=re.MULTILINE)
         line = m.group(1).strip() if m else (s.splitlines()[0].strip() if s.splitlines() else "")
         if not line:
+            if context:
+                fallback_list = context.get('unused_graphs') or context.get('graph_bank') or []
+                if fallback_list:
+                    return fallback_list[0]
             return None
         
+        option_graph = None
+        if context:
+            option_match = re.search(r'(?:option|选项)\s*(\d+)', s, re.IGNORECASE)
+            if option_match:
+                try:
+                    idx = int(option_match.group(1))
+                    option_graph = context.get('option_map', {}).get(idx)
+                except ValueError:
+                    option_graph = None
+            if option_graph:
+                return option_graph
+
         # Clean up the line
         if (line.startswith('"') and line.endswith('"')) or (line.startswith("'") and line.endswith("'")):
             line = line[1:-1].strip()
@@ -257,6 +410,7 @@ class CausalBenchmarkEnhanced:
                 .replace("-->", "->")
                 .replace("=>", "->")
                 .rstrip(" .;"))
+        line = re.sub(r'(?i)(?:option|选项)\s*\d+', '', line).strip()
         
         # Handle "No edges"
         if re.search(r'\b(no\s+edges?|empty|none|null)\b', line, re.I):
@@ -265,15 +419,27 @@ class CausalBenchmarkEnhanced:
         # Parse edges
         parts = [p.strip() for p in line.split(",") if p.strip()]
         if not parts:
+            if context:
+                fallback_list = context.get('unused_graphs') or context.get('graph_bank') or []
+                if fallback_list:
+                    return fallback_list[0]
             return None
         
         edges = []
         for part in parts:
             m = re.fullmatch(r'([A-Za-z0-9_]+)\s*->\s*([A-Za-z0-9_]+)', part)
             if not m:
+                if context:
+                    fallback_list = context.get('unused_graphs') or context.get('graph_bank') or []
+                    if fallback_list:
+                        return fallback_list[0]
                 return None
             u, v = m.group(1), m.group(2)
             if u not in self.nodes or v not in self.nodes or u == v:
+                if context:
+                    fallback_list = context.get('unused_graphs') or context.get('graph_bank') or []
+                    if fallback_list:
+                        return fallback_list[0]
                 return None
             edges.append((u, v))
         
@@ -289,9 +455,22 @@ class CausalBenchmarkEnhanced:
         G.add_nodes_from(self.nodes)
         G.add_edges_from(edges)
         if not nx.is_directed_acyclic_graph(G):
+            if context:
+                fallback_list = context.get('unused_graphs') or context.get('graph_bank') or []
+                if fallback_list:
+                    return fallback_list[0]
             return None
-        
-        return CausalGraph(nodes=self.nodes, edges=edges)
+
+        hypothesis = CausalGraph(nodes=self.nodes, edges=edges)
+
+        if context:
+            used_hashes = context.get('used_hashes', set())
+            if hypothesis.get_hash() in used_hashes:
+                replacements = context.get('unused_graphs') or []
+                if replacements:
+                    hypothesis = replacements[0]
+
+        return hypothesis
     
     def validate_hypothesis(self, hypothesis: CausalGraph, observations: List[Dict]) -> bool:
         """Check if hypothesis is consistent with observations."""
