@@ -16,7 +16,6 @@
 ## 🙏 Thanks 🙏
 This project originates from NUS CEG EEC4300 and we gratefully acknowledge the foundational groundwork provided by [CTT-Pavilion/_HypoSpace](https://github.com/CTT-Pavilion/_HypoSpace).
 
-
 ## 📖 About
 
 > **TL;DR**: HypoSpace evaluates how well LLMs generate *diverse sets* of valid hypotheses in underdetermined scientific problems, not just single correct answers.
