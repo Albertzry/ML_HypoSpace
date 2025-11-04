@@ -1,19 +1,20 @@
 import traceback
 import random
 import requests
+import re
 from abc import ABC, abstractmethod
 from typing import List, Optional, Dict, Any, Tuple
-import re
 from .models import CausalGraph
 
 
 def _extract_text(resp) -> str:
-    # 1) Responses API convenience
+    """Extract text from various API response formats"""
+    # Responses API convenience
     t = getattr(resp, "output_text", None)
     if t:
         return t
 
-    # 2) Responses API: walk output -> message -> content
+    # Responses API: walk output -> message -> content
     try:
         pieces = []
         for item in getattr(resp, "output", []) or []:
@@ -21,7 +22,6 @@ def _extract_text(resp) -> str:
                 for c in getattr(item, "content", []) or []:
                     ctype = getattr(c, "type", None) or (isinstance(c, dict) and c.get("type"))
                     if ctype in ("output_text", "text"):
-                        # pydantic object or dict
                         text = getattr(c, "text", None) if hasattr(c, "text") else c.get("text")
                         if text:
                             pieces.append(text)
@@ -30,7 +30,7 @@ def _extract_text(resp) -> str:
     except Exception:
         pass
 
-    # 3) Chat Completions fallback (if you switch endpoints)
+    # Chat Completions fallback
     try:
         return resp.choices[0].message.content
     except Exception:
@@ -40,14 +40,22 @@ def _extract_text(resp) -> str:
 
 
 def _extract_usage(resp):
+    """Extract token usage from various API response formats"""
     u = getattr(resp, "usage", None)
     if not u:
         return 0, 0, 0
-    # Responses API names
     input_tokens = getattr(u, "input_tokens", getattr(u, "prompt_tokens", 0))
     output_tokens = getattr(u, "output_tokens", getattr(u, "completion_tokens", 0))
     total_tokens = getattr(u, "total_tokens", input_tokens + output_tokens)
     return input_tokens, output_tokens, total_tokens
+
+
+def _strip_thinking_tags(text: str) -> str:
+    """Remove <think>...</think> tags from reasoning models like DeepSeek-R1"""
+    # Remove thinking blocks (case insensitive, with optional whitespace)
+    cleaned = re.sub(r'<\s*think\s*>.*?<\s*/\s*think\s*>', '', text, flags=re.DOTALL|re.IGNORECASE)
+    return cleaned.strip()
+
 
 class LLMInterface(ABC):
     """Abstract interface for LLM interaction."""
@@ -67,7 +75,6 @@ class LLMInterface(ABC):
     
     def query_with_usage(self, prompt: str) -> Dict[str, Any]:
         """Query the LLM and return response with usage stats."""
-        # Default implementation for backward compatibility
         return {
             'response': self.query(prompt),
             'usage': {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0},
@@ -81,7 +88,6 @@ class LLMInterface(ABC):
     
     def get_model_pricing(self) -> Dict[str, float]:
         """Get pricing per 1M tokens for this model."""
-        # Default pricing (can be overridden by subclasses)
         return {'input': 0.0, 'output': 0.0}
     
     def reset(self):
@@ -90,11 +96,7 @@ class LLMInterface(ABC):
 
 
 class OpenRouterLLM(LLMInterface):
-    """
-    OpenRouter API interface for various LLM models.
-    
-    OpenRouter provides access to multiple models through a single API.
-    """
+    """OpenRouter API interface for various LLM models"""
     
     def __init__(
         self,
@@ -104,16 +106,6 @@ class OpenRouterLLM(LLMInterface):
         max_tokens: int = 40960,
         base_url: str = "https://openrouter.ai/api/v1"
     ):
-        """
-        Initialize OpenRouter LLM interface.
-        
-        Args:
-            model: Model identifier (e.g., "anthropic/claude-3.5-sonnet", "openai/gpt-4")
-            api_key: OpenRouter API key
-            temperature: Sampling temperature
-            max_tokens: Maximum tokens in response
-            base_url: OpenRouter API base URL
-        """
         if not api_key:
             raise ValueError("OpenRouter API key is required")
         
@@ -125,9 +117,10 @@ class OpenRouterLLM(LLMInterface):
         self.headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
-            # "HTTP-Referer":"http://localhost:3000",  # Required by OpenRouter
-            # "X-Title": "Cre ativity Benchmark"  # Optional, for OpenRouter dashboard
         }
+        
+        # Detect if this is a reasoning model
+        self.is_reasoning_model = 'deepseek' in model.lower() and ('r1' in model.lower() or 'reasoning' in model.lower())
     
     def query(self, prompt: str) -> str:
         """Query OpenRouter API."""
@@ -135,20 +128,13 @@ class OpenRouterLLM(LLMInterface):
         return result['response']
     
     def query_with_usage(self, prompt: str) -> Dict[str, Any]:
-        """Query OpenRouter API with usage tracking."""
+        """Query OpenRouter API with usage tracking and reasoning model support"""
         try:
             url = f"{self.base_url}/chat/completions"
             payload = {
                 "model": self.model,
                 "messages": [
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are an expert in boolean logic discovery. "
-                            "Given partial truth tables, you craft concise boolean expressions that satisfy "
-                            "all provided observations while exploring structurally diverse hypotheses."
-                        ),
-                    },
+                    {"role": "system", "content": "You are an expert in Boolean logic and logical expressions."},
                     {"role": "user", "content": prompt}
                 ],
                 "temperature": self.temperature,
@@ -157,10 +143,15 @@ class OpenRouterLLM(LLMInterface):
             
             response = requests.post(url, headers=self.headers, json=payload)
             response.raise_for_status()
-            # print('result0',response)
             result = response.json()
-            # print('result1',result['choices'][0]['message']['content'])
-            # print('result2',result)
+            
+            # Extract response content
+            response_content = result['choices'][0]['message']['content']
+            
+            # Strip thinking tags for reasoning models
+            if self.is_reasoning_model:
+                response_content = _strip_thinking_tags(response_content)
+            
             # Extract usage information
             usage = result.get('usage', {})
             usage_data = {
@@ -169,13 +160,13 @@ class OpenRouterLLM(LLMInterface):
                 'total_tokens': usage.get('total_tokens', 0)
             }
             
-            # Calculate cost based on model pricing
+            # Calculate cost
             pricing = self.get_model_pricing()
             cost = (usage_data['prompt_tokens'] * pricing['input'] + 
                    usage_data['completion_tokens'] * pricing['output']) / 1_000_000
             
             return {
-                'response': result['choices'][0]['message']['content'],
+                'response': response_content,
                 'usage': usage_data,
                 'cost': cost
             }
@@ -199,24 +190,20 @@ class OpenRouterLLM(LLMInterface):
     
     def get_model_pricing(self) -> Dict[str, float]:
         """Get pricing per 1M tokens for common models."""
-        # Pricing in dollars per 1M tokens
         pricing_map = {
             'anthropic/claude-3.5-sonnet': {'input': 3.0, 'output': 15.0},
             'anthropic/claude-3-opus': {'input': 15.0, 'output': 75.0},
             'openai/gpt-4o': {'input': 2.5, 'output': 10.0},
             'meta-llama/llama-3.3-70b-instruct': {'input': 0.038, 'output': 0.12},
             'google/gemini-2.5-pro': {'input': 1.25, 'output': 10.0},
-            'deepseek/deepseek-r1': {'input': 0.4, 'output': 2},
+            'deepseek/deepseek-r1': {'input': 0.4, 'output': 2.0},
+            'deepseek/deepseek-chat': {'input': 0.14, 'output': 0.28},
         }
         return pricing_map.get(self.model, {'input': 1.0, 'output': 1.0})
 
 
 class OpenAILLM(LLMInterface):
-    """
-    OpenAI API interface for GPT models.
-    
-    Requires openai package and API key.
-    """
+    """OpenAI API interface for GPT models"""
     
     def __init__(
         self, 
@@ -225,15 +212,6 @@ class OpenAILLM(LLMInterface):
         temperature: float = 0.7,
         max_tokens: int = 40960
     ):
-        """
-        Initialize OpenAI LLM interface.
-        
-        Args:
-            model: OpenAI model to use
-            api_key: OpenAI API key (uses environment variable if not provided)
-            temperature: Sampling temperature
-            max_tokens: Maximum tokens in response
-        """
         try:
             import openai
         except ImportError:
@@ -247,9 +225,12 @@ class OpenAILLM(LLMInterface):
             import os
             api_key = os.getenv("OPENAI_API_KEY")
             if not api_key:
-                raise ValueError("OpenAI API key must be provided or set as OPENAI_API_KEY environment variable")
+                raise ValueError("OpenAI API key must be provided")
         
         self.client = openai.OpenAI(api_key=api_key)
+        
+        # Detect reasoning models (o1, o3, etc.)
+        self.is_reasoning_model = any(x in model.lower() for x in ['o1', 'o3', 'reasoning'])
     
     def query(self, prompt: str) -> str:
         """Query OpenAI API."""
@@ -257,19 +238,12 @@ class OpenAILLM(LLMInterface):
         return result['response']
     
     def query_with_usage(self, prompt: str) -> Dict[str, Any]:
+        """Query OpenAI API with usage tracking"""
         try:
-            # print(self.max_tokens)
             resp = self.client.responses.create(
                 model=self.model,
                 input=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are an expert in boolean logic discovery. "
-                            "Use the observations to propose structurally diverse boolean expressions "
-                            "that exactly match every provided input-output pair."
-                        ),
-                    },
+                    {"role": "system", "content": "You are an expert in Boolean logic and logical expressions."},
                     {"role": "user", "content": prompt},
                 ],
                 reasoning={"effort": "medium"},
@@ -277,12 +251,16 @@ class OpenAILLM(LLMInterface):
             )
 
             text = _extract_text(resp)
+            
+            # Strip thinking for reasoning models
+            if self.is_reasoning_model:
+                text = _strip_thinking_tags(text)
+            
             in_tok, out_tok, tot_tok = _extract_usage(resp)
 
             pricing = self.get_model_pricing()
             cost = (in_tok * pricing['input'] + out_tok * pricing['output']) / 1_000_000
 
-            # print(text)
             return {
                 "response": text,
                 "usage": {
@@ -306,38 +284,26 @@ class OpenAILLM(LLMInterface):
     
     def get_model_pricing(self) -> Dict[str, float]:
         """Get pricing per 1M tokens for OpenAI models."""
-        # Pricing in dollars per 1M tokens
         pricing_map = {
             'gpt-4o': {'input': 2.5, 'output': 10.0},
             'gpt-4o-mini': {'input': 0.15, 'output': 0.6},
-            'gpt-5': {'input': 1.25, 'output': 10.0}
+            'gpt-5': {'input': 1.25, 'output': 10.0},
+            'o1': {'input': 15.0, 'output': 60.0},
+            'o1-mini': {'input': 3.0, 'output': 12.0},
         }
         return pricing_map.get(self.model, {'input': 10.0, 'output': 30.0})
 
 
 class AnthropicLLM(LLMInterface):
-    """
-    Anthropic Claude API interface.
-    
-    Requires anthropic package and API key.
-    """
+    """Anthropic Claude API interface"""
     
     def __init__(
         self,
         model: str = "claude-3-opus-20240229",
         api_key: Optional[str] = None,
         temperature: float = 0.7,
-        max_tokens: int = 500
+        max_tokens: int = 4096
     ):
-        """
-        Initialize Anthropic LLM interface.
-        
-        Args:
-            model: Anthropic model to use
-            api_key: Anthropic API key (uses environment variable if not provided)
-            temperature: Sampling temperature
-            max_tokens: Maximum tokens in response
-        """
         try:
             import anthropic
         except ImportError:
@@ -359,7 +325,7 @@ class AnthropicLLM(LLMInterface):
         try:
             response = self.client.messages.create(
                 model=self.model,
-                # max_tokens=self.max_tokens,
+                max_tokens=self.max_tokens,
                 temperature=self.temperature,
                 messages=[
                     {"role": "user", "content": prompt}
@@ -396,7 +362,6 @@ class AnthropicLLM(LLMInterface):
     
     def get_model_pricing(self) -> Dict[str, float]:
         """Get pricing per 1M tokens for Anthropic models."""
-        # Pricing in dollars per 1M tokens
         pricing_map = {
             'claude-3-opus-20240229': {'input': 15.0, 'output': 75.0},
             'claude-3-sonnet-20240229': {'input': 3.0, 'output': 15.0},
@@ -431,7 +396,6 @@ class ResponseParser:
             # Extract edges
             edges = ResponseParser._extract_edges(response)
             if not edges:
-                # Try alternative extraction methods
                 edges = ResponseParser._extract_edges_alternative(response)
             
             if nodes and edges:
@@ -456,7 +420,6 @@ class ResponseParser:
     @staticmethod
     def _extract_nodes(response: str) -> Optional[List[str]]:
         """Extract node list from response."""
-        # Try different patterns
         patterns = [
             r'nodes?\s*\[([^\]]+)\]',
             r'nodes?\s*:\s*\[([^\]]+)\]',
@@ -469,9 +432,8 @@ class ResponseParser:
             match = re.search(pattern, response, re.IGNORECASE)
             if match:
                 nodes_str = match.group(1)
-                # Clean and split
                 nodes = [n.strip().strip("'\"") for n in nodes_str.split(',')]
-                return [n for n in nodes if n]  # Filter empty strings
+                return [n for n in nodes if n]
         
         return None
     
@@ -480,7 +442,6 @@ class ResponseParser:
         """Extract edges from response."""
         edges = []
         
-        # Edge patterns to look for
         edge_patterns = [
             r'(\w+)\s*->\s*(\w+)',
             r'(\w+)\s*→\s*(\w+)',
@@ -493,10 +454,10 @@ class ResponseParser:
             matches = re.findall(pattern, response, re.IGNORECASE)
             for match in matches:
                 src, dst = match[0].strip(), match[1].strip()
-                if src and dst and src != dst:  # Avoid self-loops
+                if src and dst and src != dst:
                     edges.append((src, dst))
         
-        # Remove duplicates while preserving order
+        # Remove duplicates
         seen = set()
         unique_edges = []
         for edge in edges:
@@ -511,15 +472,12 @@ class ResponseParser:
         """Alternative method for extracting edges."""
         edges = []
         
-        # Look for edges in format "edges: A->B, C->D, ..."
         edges_match = re.search(r'edges?:?\s*([^.]+)', response, re.IGNORECASE)
         if edges_match:
             edges_str = edges_match.group(1)
             
-            # Split by comma and parse each edge
             edge_parts = edges_str.split(',')
             for part in edge_parts:
-                # Try to extract edge from each part
                 edge_match = re.search(r'(\w+)\s*(?:->|→)\s*(\w+)', part)
                 if edge_match:
                     edges.append((edge_match.group(1), edge_match.group(2)))
