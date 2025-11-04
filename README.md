@@ -55,20 +55,23 @@ Across instruction-tuned and reasoning-focused models, **Validity** often remain
 
 </div>
 
-| |
-|:--:|
-| ![Causal Graphs](figs/casual.png) |
-| *🧬 Causal Graphs* |
+<p align="center">
+  <img src="figs/casual.png" alt="Causal" height="200">
+  <br>
+  🧬 Causal Graphs
+</p>
 
-| |
-|:--:|
-| ![3D Reconstruction](figs/3d.png) |
-| *📦 3D Reconstruction* |
+<p align="center">
+  <img src="figs/3d.png" alt="3D Reconstruction" height="200">
+  <br>
+  📦 3D Reconstruction
+</p>
 
-| |
-|:--:|
-| ![Boolean Logic](figs/bool.png) |
-| *🔀 Boolean Logic* |
+<p align="center">
+  <img src="figs/bool.png" alt="Boolean Logic" height="200">
+  <br>
+  🔀 Boolean Logic
+</p>
 
 
 
