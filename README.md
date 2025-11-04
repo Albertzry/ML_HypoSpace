@@ -60,12 +60,12 @@ Across instruction-tuned and reasoning-focused models, **Validity** often remain
     <img src="figs/casual.png" alt="Causal" height="200" style="display:block; margin:0 auto;" />
     <figcaption style="margin-top:6px; font-size:0.95em;">🧬 Causal Graphs</figcaption>
   </figure>
-
+  <br/>
   <figure style="display:block; margin:12px auto; text-align:center;">
     <img src="figs/3d.png" alt="3D Reconstruction" height="200" style="display:block; margin:0 auto;" />
     <figcaption style="margin-top:6px; font-size:0.95em;">📦 3D Reconstruction</figcaption>
   </figure>
-
+  <br/>
   <figure style="display:block; margin:12px auto; text-align:center;">
     <img src="figs/bool.png" alt="Boolean Logic" height="200" style="display:block; margin:0 auto;" />
     <figcaption style="margin-top:6px; font-size:0.95em;">🔀 Boolean Logic</figcaption>
