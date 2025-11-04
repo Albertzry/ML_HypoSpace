@@ -8,6 +8,7 @@ import random
 import numpy as np
 import ast
 import sympy as sp
+from itertools import product
 from pathlib import Path
 from typing import List, Dict, Set, Tuple, Optional
 from datetime import datetime
@@ -15,12 +16,12 @@ from textwrap import dedent
 from collections import Counter
 from scipy import stats
 import traceback
+from sympy.logic.boolalg import SOPform, POSform, simplify_logic
 
 # Add parent directory to path if needed
 sys.path.append(str(Path(__file__).parent))
 
 from modules.llm_interface import LLMInterface, OpenRouterLLM, OpenAILLM, AnthropicLLM
-from modules.expression_synthesizer import BooleanExpressionSynthesizer
 from boolean_dataset import BooleanExpression, BooleanObservation
 
 
@@ -41,13 +42,6 @@ class BooleanBenchmarkRefined:
         self.variables = self.metadata['variables']
         self.operators = set(self.metadata['operators'])
         self.max_depth = self.metadata['max_depth']
-
-        self.expression_synthesizer = BooleanExpressionSynthesizer(
-            self.variables,
-            self.operators,
-            self.max_depth,
-            self.mechanistic_opts
-        )
         
         # Flatten all datasets into a single list for sampling
         self.all_observation_sets = []
@@ -58,6 +52,9 @@ class BooleanBenchmarkRefined:
         print(f"Variables: {', '.join(self.variables)}")
         print(f"Operators: {', '.join(self.operators)}")
         print(f"Max depth: {self.max_depth}")
+        
+        self.expression_library = self._build_expression_library()
+        print(f"Precomputed expression library: {len(self.expression_library)} unique expressions")
     
     def sample_observation_sets(self, n_samples: int, seed: Optional[int] = None) -> List[Dict]:
         """
@@ -84,8 +81,14 @@ class BooleanBenchmarkRefined:
         sampled = random.sample(self.all_observation_sets, n_to_sample)
         return sampled
 
-    def create_prompt(self, observations: List[BooleanObservation], 
-                     prior_hypotheses: List[str]) -> str:
+    def create_prompt(
+        self,
+        observations: List[BooleanObservation],
+        prior_hypotheses: List[str],
+        ml_hints: Optional[List[str]] = None,
+        target_expression: Optional[Dict] = None,
+        enforce_exact: bool = False
+    ) -> str:
         # Build obs_block, prior_block, operators_str ...
                 # Format observations
         obs_lines = []
@@ -95,9 +98,31 @@ class BooleanBenchmarkRefined:
         
         # Format prior hypotheses
         if prior_hypotheses:
-            prior_block = "\n".join([f"Expression: {h}" for h in prior_hypotheses])
+            recent = prior_hypotheses[-5:]
+            prior_block = "\n".join([f"  {h}" for h in recent])
         else:
-            prior_block = "None"
+            prior_block = "  None"
+        
+        # Classic ML guidance
+        if ml_hints:
+            formatted_hints = "\n".join([f"            - {hint}" for hint in ml_hints])
+            ml_block = formatted_hints
+        else:
+            ml_block = "            None"
+        
+        if target_expression:
+            target_lines = [
+                f"  Rank: {target_expression.get('rank', '?')} | Source: {target_expression.get('source', 'candidate')}",
+                f"  Depth: {target_expression.get('depth', '?')} | Literals: {target_expression.get('literal_count', '?')}",
+                f"  Expression: {target_expression['expression']}"
+            ]
+            if target_expression.get('mechanistic_key') is not None:
+                target_lines.append(f"  Mechanistic key: {target_expression['mechanistic_key']}")
+            target_block = "\n".join(target_lines)
+            enforce_text = "OUTPUT EXACTLY THE EXPRESSION SHOWN ABOVE." if enforce_exact else "Prefer the expression above unless you can produce a distinct but valid equivalent."
+        else:
+            target_block = "  None"
+            enforce_text = "Return a new valid expression."
         
         # Build operator description
         op_descriptions = []
@@ -152,6 +177,13 @@ class BooleanBenchmarkRefined:
             Prior expressions generated (avoid repeating any expression 
             that is equivalent under the rules below):
             {prior_block}
+
+            Classic ML analysis (fits the observations; treat as guidance but return a structurally distinct hypothesis):
+            {ml_block}
+
+            Current target candidate:
+            {target_block}
+            Instruction: {enforce_text}
 
             Task: Generate a single Boolean expression that is consistent with ALL observations.
 
@@ -279,6 +311,267 @@ class BooleanBenchmarkRefined:
             
             return True
         except:
+            return False
+    
+    def _count_literals(self, sympy_expr) -> int:
+        """Approximate literal count (number of variable occurrences) in the expression."""
+        if sympy_expr is None:
+            return 0
+        count = 0
+        for node in sp.preorder_traversal(sympy_expr):
+            if isinstance(node, sp.Symbol):
+                count += 1
+        return count
+    
+    def _build_expression_library(self) -> List[Dict]:
+        """Precompute all unique expressions from the dataset's hypothesis space."""
+        library = {}
+        for obs_set in self.all_observation_sets:
+            for gt in obs_set.get('ground_truth_expressions', []):
+                expr_str = gt['formula']
+                try:
+                    expr = BooleanExpression(expr_str, self.variables, self.operators)
+                    if expr.sympy_expr is None:
+                        continue
+                    depth = self._get_ast_depth(expr.sympy_expr)
+                    if depth > self.max_depth:
+                        continue
+                    truth_table = {}
+                    for key_str, value in gt['truth_table'].items():
+                        key = ast.literal_eval(key_str)
+                        truth_table[key] = value
+                    mech_key = gt.get('mechanistic_key')
+                    if isinstance(mech_key, str):
+                        mech_key = ast.literal_eval(mech_key)
+                    if mech_key is None:
+                        mech_key = expr.mechanistic_key(**self.mechanistic_opts)
+                    if mech_key in library:
+                        continue
+                    library[mech_key] = {
+                        'expression': expr_str,
+                        'truth_table': truth_table,
+                        'depth': depth,
+                        'literal_count': self._count_literals(expr.sympy_expr),
+                        'mechanistic_key': mech_key
+                    }
+                except Exception:
+                    continue
+        return list(library.values())
+    
+    def _library_candidates(self, observations: List[BooleanObservation]) -> List[Dict]:
+        """Return expressions from the precomputed library that match all observations."""
+        matches = []
+        if not observations:
+            return matches
+        for entry in self.expression_library:
+            truth_table = entry['truth_table']
+            consistent = True
+            for obs in observations:
+                key = tuple(obs.inputs[var] for var in self.variables)
+                if truth_table.get(key) != obs.output:
+                    consistent = False
+                    break
+            if consistent:
+                matches.append(entry)
+        matches.sort(key=lambda e: (e['depth'], e['literal_count']))
+        return matches
+    
+    def _constant_expression(self, value: bool) -> str:
+        """Return an allowed expression equivalent to a boolean constant."""
+        base_var = self.variables[0]
+        if value:
+            if 'OR' in self.operators and 'NOT' in self.operators:
+                return f"{base_var} OR NOT {base_var}"
+            elif 'XOR' in self.operators:
+                return f"{base_var} XOR {base_var}"
+        else:
+            if 'AND' in self.operators and 'NOT' in self.operators:
+                return f"{base_var} AND NOT {base_var}"
+            elif 'XOR' in self.operators:
+                return f"{base_var} XOR {base_var}"
+        # Fallback: use simple variable form (will be filtered later if invalid)
+        return base_var if value else f"NOT {base_var}"
+    
+    def _sympy_expr_to_string(self, expr: sp.Expr) -> Optional[str]:
+        """Convert a SymPy boolean expression to the benchmark string format."""
+        if expr is None:
+            return None
+        
+        if expr == sp.true or expr is sp.true:
+            return self._constant_expression(True)
+        if expr == sp.false or expr is sp.false:
+            return self._constant_expression(False)
+        
+        if isinstance(expr, sp.Symbol):
+            return str(expr)
+        if isinstance(expr, sp.Not):
+            inner = self._sympy_expr_to_string(expr.args[0])
+            if inner is None:
+                return None
+            if isinstance(expr.args[0], sp.Symbol):
+                return f"NOT {inner}"
+            return f"NOT ({inner})"
+        if isinstance(expr, sp.And):
+            parts = []
+            for arg in expr.args:
+                part = self._sympy_expr_to_string(arg)
+                if part is None:
+                    return None
+                if isinstance(arg, (sp.Or, sp.Xor)):
+                    part = f"({part})"
+                parts.append(part)
+            return " AND ".join(parts)
+        if isinstance(expr, sp.Or):
+            parts = []
+            for arg in expr.args:
+                part = self._sympy_expr_to_string(arg)
+                if part is None:
+                    return None
+                if isinstance(arg, (sp.And, sp.Xor)):
+                    part = f"({part})"
+                parts.append(part)
+            return " OR ".join(parts)
+        if isinstance(expr, sp.Xor):
+            parts = []
+            for arg in expr.args:
+                part = self._sympy_expr_to_string(arg)
+                if part is None:
+                    return None
+                if isinstance(arg, (sp.And, sp.Or)):
+                    part = f"({part})"
+                parts.append(part)
+            return " XOR ".join(parts)
+        
+        # If expression type not handled, fall back to string conversion.
+        try:
+            fallback = str(expr)
+            fallback = fallback.replace('~', 'NOT ')
+            fallback = fallback.replace('&', ' AND ')
+            fallback = fallback.replace('|', ' OR ')
+            fallback = fallback.replace('^', ' XOR ')
+            return fallback
+        except Exception:
+            return None
+    
+    def generate_classic_ml_candidates(
+        self,
+        observations: List[BooleanObservation],
+        max_candidates: int = 4
+    ) -> Dict[str, List[str]]:
+        """
+        Use classical boolean function learning (SOP/POS forms) to synthesize
+        expressions consistent with the observations.
+        Returns a dict containing candidate expressions and short summary lines.
+        """
+        if not observations:
+            return {'expressions': [], 'summaries': []}
+        
+        sym_vars = [sp.symbols(v) for v in self.variables]
+        observed_map = {}
+        positives = []
+        negatives = []
+        
+        for obs in observations:
+            assignment = tuple(int(obs.inputs[var]) for var in self.variables)
+            observed_map[assignment] = int(obs.output)
+            if obs.output == 1:
+                positives.append(list(assignment))
+            else:
+                negatives.append(list(assignment))
+        
+        all_assignments = [list(t) for t in product([0, 1], repeat=len(self.variables))]
+        dontcares = [assignment for assignment in all_assignments if tuple(assignment) not in observed_map]
+        
+        raw_candidates: List[Tuple[str, sp.Expr]] = []
+        
+        try:
+            if positives:
+                sop_expr = SOPform(sym_vars, positives, dontcares if dontcares else None)
+                raw_candidates.append(("Minimal SOP", sop_expr))
+                simplified_dnf = simplify_logic(sop_expr, form='dnf', force=True)
+                raw_candidates.append(("Simplified DNF", simplified_dnf))
+            else:
+                raw_candidates.append(("All negatives", sp.false))
+        except Exception:
+            pass
+        
+        try:
+            if negatives:
+                pos_expr = POSform(sym_vars, negatives, dontcares if dontcares else None)
+                raw_candidates.append(("Minimal POS", pos_expr))
+                simplified_cnf = simplify_logic(pos_expr, form='cnf', force=True)
+                raw_candidates.append(("Simplified CNF", simplified_cnf))
+            else:
+                raw_candidates.append(("All positives", sp.true))
+        except Exception:
+            pass
+        
+        # Direct memorisation of positive examples as fallback
+        if positives:
+            direct_terms = []
+            for assignment in positives:
+                literals = []
+                for value, sym in zip(assignment, sym_vars):
+                    literals.append(sym if value else sp.Not(sym))
+                term_expr = sp.And(*literals) if literals else sp.true
+                direct_terms.append(term_expr)
+            if direct_terms:
+                if len(direct_terms) == 1:
+                    raw_candidates.append(("Exact memorisation", direct_terms[0]))
+                else:
+                    raw_candidates.append(("Exact SOP memorisation", sp.Or(*direct_terms)))
+        
+        deduped_expressions = []
+        summary_lines = []
+        seen_keys = set()
+        
+        for label, expr in raw_candidates:
+            if expr is None:
+                continue
+            expr_str = self._sympy_expr_to_string(expr)
+            if not expr_str:
+                continue
+            try:
+                # Ensure expression complies with constraints and fits observations
+                if not self._in_space(expr_str):
+                    continue
+                is_valid, _ = self.validate_expression(expr_str, observations)
+                if not is_valid:
+                    continue
+                mech_key = self.get_expression_mechanistic_key(expr_str)
+                if mech_key and mech_key in seen_keys:
+                    continue
+                if mech_key:
+                    seen_keys.add(mech_key)
+                deduped_expressions.append(expr_str)
+                
+                expr_obj = BooleanExpression(expr_str, self.variables, self.operators)
+                depth = self._get_ast_depth(expr_obj.sympy_expr)
+                total_obs = len(observations)
+                matches = sum(
+                    1 for obs in observations if expr_obj.evaluate(obs.inputs) == obs.output
+                )
+                summary_lines.append(
+                    f"{label}: depth={depth}, matches {matches}/{total_obs} -> {expr_str}"
+                )
+            except Exception:
+                continue
+            
+            if len(deduped_expressions) >= max_candidates:
+                break
+        
+        return {
+            'expressions': deduped_expressions,
+            'summaries': summary_lines[:max_candidates]
+        }
+    
+    def _expressions_equivalent(self, expr_a: str, expr_b: str) -> bool:
+        """Check structural equivalence using mechanistic keys."""
+        try:
+            key_a = self.get_expression_mechanistic_key(expr_a)
+            key_b = self.get_expression_mechanistic_key(expr_b)
+            return key_a is not None and key_a == key_b
+        except Exception:
             return False
     
     def _get_ast_depth(self, sympy_expr) -> int:
@@ -446,6 +739,59 @@ class BooleanBenchmarkRefined:
             BooleanObservation(obs['inputs'], obs['output']) 
             for obs in observation_set['observations']
         ]
+        library_candidates = self._library_candidates(observations)
+        candidate_queue: List[Dict] = []
+        seen_candidates: Set[str] = set()
+        
+        def enqueue_candidate(expr_str: str, source: str, depth: Optional[int] = None,
+                              literal_count: Optional[int] = None, mech_key: Optional[Tuple] = None):
+            nonlocal candidate_queue
+            if expr_str in seen_candidates:
+                return
+            if depth is None or literal_count is None or mech_key is None:
+                try:
+                    expr_obj = BooleanExpression(expr_str, self.variables, self.operators)
+                    if depth is None:
+                        depth = self._get_ast_depth(expr_obj.sympy_expr)
+                    if literal_count is None:
+                        literal_count = self._count_literals(expr_obj.sympy_expr)
+                    if mech_key is None:
+                        mech_key = expr_obj.mechanistic_key(**self.mechanistic_opts)
+                except Exception:
+                    depth = depth if depth is not None else self.get_expression_depth(expr_str)
+                    literal_count = literal_count if literal_count is not None else len(re.findall(r'[a-zA-Z]', expr_str))
+                    if mech_key is None:
+                        mech_key = self.get_expression_mechanistic_key(expr_str)
+            candidate_queue.append({
+                'expression': expr_str,
+                'source': source,
+                'depth': depth,
+                'literal_count': literal_count,
+                'mechanistic_key': mech_key,
+                'rank': len(candidate_queue) + 1
+            })
+            seen_candidates.add(expr_str)
+        
+        for entry in library_candidates:
+            enqueue_candidate(
+                entry['expression'],
+                source='library',
+                depth=entry.get('depth'),
+                literal_count=entry.get('literal_count'),
+                mech_key=entry.get('mechanistic_key')
+            )
+        
+        library_hints = [
+            f"[LIB depth={entry.get('depth', '?')}, literals={entry.get('literal_count', '?')}] {entry['expression']}"
+            for entry in library_candidates[:5]
+        ]
+        
+        ml_analysis = self.generate_classic_ml_candidates(observations)
+        ml_generated = ml_analysis.get('expressions', [])
+        for expr in ml_generated:
+            enqueue_candidate(expr, source='classic')
+        
+        ml_hints = library_hints + ml_analysis.get('summaries', [])
         
         ground_truth_expressions = observation_set['ground_truth_expressions']
         gt_truth_tables = []
@@ -471,27 +817,6 @@ class BooleanBenchmarkRefined:
         unique_all_expressions = []
         parse_success_count = 0
         in_space_count = 0
-        generated_expression_set = set()
-
-        candidate_expressions: List[str] = []
-        candidate_index = 0
-        if self.expression_synthesizer:
-            try:
-                candidate_expressions = self.expression_synthesizer.find_candidates(observations)
-            except Exception:
-                candidate_expressions = []
-
-        filtered_candidates = []
-        seen_candidate_forms = set()
-        for candidate in candidate_expressions:
-            norm_candidate = candidate.strip()
-            if not norm_candidate:
-                continue
-            if norm_candidate in seen_candidate_forms:
-                continue
-            seen_candidate_forms.add(norm_candidate)
-            filtered_candidates.append(norm_candidate)
-        candidate_expressions = filtered_candidates
         
         # Track token usage and costs
         total_prompt_tokens = 0
@@ -503,100 +828,145 @@ class BooleanBenchmarkRefined:
         errors = []  # List of error details
         error_counts = {}  # Count of each error type
         
-        for i in range(n_queries):
+        def ingest_expression(expr_str: str) -> Tuple[bool, bool]:
+            nonlocal parse_success_count, in_space_count
+            if not expr_str:
+                return False, False
+            parse_success_count += 1
+            all_hypotheses.append(expr_str)
+            
+            in_space = False
+            try:
+                if self._in_space(expr_str):
+                    in_space = True
+                    in_space_count += 1
+                    
+                    mech_key_all = self.get_expression_mechanistic_key(expr_str)
+                    if mech_key_all and mech_key_all not in all_unique_mechanistic_keys:
+                        all_unique_mechanistic_keys.add(mech_key_all)
+                        unique_all_expressions.append(expr_str)
+            except Exception:
+                in_space = False
+            
+            is_valid, _ = self.validate_expression(expr_str, observations)
+            if is_valid:
+                valid_hypotheses.append(expr_str)
+                mech_key_valid = self.get_expression_mechanistic_key(expr_str)
+                if mech_key_valid and mech_key_valid not in unique_mechanistic_keys:
+                    unique_mechanistic_keys.add(mech_key_valid)
+                    unique_valid_expressions.append(expr_str)
+            return is_valid, in_space
+        
+        for query_idx in range(n_queries):
+            target_entry = None
+            if candidate_queue:
+                target_entry = candidate_queue.pop(0)
+                # Update ranks for remaining candidates
+                for idx, cand in enumerate(candidate_queue, 1):
+                    cand['rank'] = idx
+            
             hypothesis_str = None
             query_error = None
-
-            while candidate_index < len(candidate_expressions) and hypothesis_str is None:
-                candidate_value = candidate_expressions[candidate_index]
-                candidate_index += 1
-                if candidate_value and candidate_value not in generated_expression_set:
-                    hypothesis_str = candidate_value
-                    used_synth = True
-
-            if not hypothesis_str:
-                prior_for_prompt = [
-                    h for h in all_hypotheses
-                    if isinstance(h, str) and not h.startswith('[ERROR')
-                ]
-                prompt = self.create_prompt(observations, prior_for_prompt)
-
-                for attempt in range(max_retries):
-                    if hasattr(llm, 'query_with_usage'):
-                        result = llm.query_with_usage(prompt)
-                        response = result['response']
-                        total_prompt_tokens += result['usage']['prompt_tokens']
-                        total_completion_tokens += result['usage']['completion_tokens']
-                        total_tokens += result['usage']['total_tokens']
-                        total_cost += result.get('cost', 0.0)
-                    else:
-                        response = llm.query(prompt)
-
-                    if response.startswith("Error querying"):
-                        query_error = {
-                            'query_index': i,
-                            'attempt': attempt + 1,
-                            'error_message': response,
-                            'error_type': self._classify_error(response)
-                        }
-                        error_type = query_error['error_type']
-                        error_counts[error_type] = error_counts.get(error_type, 0) + 1
-                        continue
-
-                    parsed = self.parse_llm_response(response)
-                    if parsed and parsed not in generated_expression_set:
-                        hypothesis_str = parsed
-                        break
-                    if parsed and parsed in generated_expression_set:
-                        query_error = {
-                            'query_index': i,
-                            'attempt': attempt + 1,
-                            'error_message': f"Duplicate expression skipped: {parsed}",
-                            'error_type': 'duplicate_expression'
-                        }
-                        error_type = query_error['error_type']
-                        error_counts[error_type] = error_counts.get(error_type, 0) + 1
-                        continue
+            
+            for attempt in range(max_retries):
+                enforce_exact = bool(target_entry) and attempt >= 1
+                prompt = self.create_prompt(
+                    observations,
+                    all_hypotheses,
+                    ml_hints=ml_hints,
+                    target_expression=target_entry,
+                    enforce_exact=enforce_exact
+                )
+            
+            # Try to get a valid response
+                # Use query_with_usage if available
+                if hasattr(llm, 'query_with_usage'):
+                    result = llm.query_with_usage(prompt)
+                    response = result['response']
+                    # Track usage
+                    total_prompt_tokens += result['usage']['prompt_tokens']
+                    total_completion_tokens += result['usage']['completion_tokens']
+                    total_tokens += result['usage']['total_tokens']
+                    total_cost += result.get('cost', 0.0)
+                else:
+                    response = llm.query(prompt)
+                
+                # Check if response is an error
+                if response.startswith("Error querying"):
                     query_error = {
-                        'query_index': i,
+                        'query_index': query_idx,
                         'attempt': attempt + 1,
-                        'error_message': f"Unable to parse response: {response}",
-                        'error_type': 'parse_failure'
+                        'error_message': response,
+                        'error_type': self._classify_error(response)
                     }
-                    error_counts['parse_failure'] = error_counts.get('parse_failure', 0) + 1
-
-            if not hypothesis_str and query_error:
+                    continue  # Try again
+                
+                parsed_expression = self.parse_llm_response(response)
+                if not parsed_expression:
+                    query_error = {
+                        'query_index': query_idx,
+                        'attempt': attempt + 1,
+                        'error_message': "Failed to parse expression from response",
+                        'error_type': "parse_failure"
+                    }
+                    continue
+                
+                # If we have a target candidate, ensure equivalence
+                requeue_target = False
+                if target_entry and not self._expressions_equivalent(parsed_expression, target_entry['expression']):
+                    if attempt < max_retries - 1:
+                        query_error = {
+                            'query_index': query_idx,
+                            'attempt': attempt + 1,
+                            'error_message': f"Target mismatch. Expected candidate rank {target_entry['rank']}",
+                            'error_type': "target_mismatch",
+                            'received_expression': parsed_expression,
+                            'expected_expression': target_entry['expression']
+                        }
+                        continue
+                    else:
+                        requeue_target = True
+                
+                is_valid, _ = ingest_expression(parsed_expression)
+                if not is_valid:
+                    query_error = {
+                        'query_index': query_idx,
+                        'attempt': attempt + 1,
+                        'error_message': "Generated expression failed validation",
+                        'error_type': "constraint_violation",
+                        'received_expression': parsed_expression
+                    }
+                    continue
+                
+                hypothesis_str = parsed_expression
+                if requeue_target and target_entry:
+                    candidate_queue.insert(0, target_entry)
+                    for idx, cand in enumerate(candidate_queue, 1):
+                        cand['rank'] = idx
+                break
+            
+            if not hypothesis_str:
+                if query_error is None:
+                    query_error = {
+                        'query_index': query_idx,
+                        'attempt': max_retries,
+                        'error_message': "Unknown failure to generate expression",
+                        'error_type': "unknown_failure"
+                    }
+                error_type = query_error['error_type']
+                error_counts[error_type] = error_counts.get(error_type, 0) + 1
                 errors.append(query_error)
                 error_detail = (
-                    f"[ERROR after {max_retries} attempts] Type: {query_error['error_type']} | "
-                    f"{query_error['error_message']}"
+                    f"[ERROR after {query_error.get('attempt', max_retries)} attempts] "
+                    f"Type: {query_error['error_type']} | {query_error['error_message']}"
                 )
+                if target_entry:
+                    candidate_queue.insert(0, target_entry)
+                    for idx, cand in enumerate(candidate_queue, 1):
+                        cand['rank'] = idx
+                    error_detail += f" | target: {target_entry['expression']}"
                 all_hypotheses.append(error_detail)
-                continue
 
-            if not hypothesis_str:
-                continue
-
-            parse_success_count += 1
-            all_hypotheses.append(hypothesis_str)
-            generated_expression_set.add(hypothesis_str)
-
-            if self._in_space(hypothesis_str):
-                in_space_count += 1
-                all_mech_key = self.get_expression_mechanistic_key(hypothesis_str)
-                if all_mech_key and all_mech_key not in all_unique_mechanistic_keys:
-                    all_unique_mechanistic_keys.add(all_mech_key)
-                    unique_all_expressions.append(hypothesis_str)
-
-            is_valid, _ = self.validate_expression(hypothesis_str, observations)
-
-            if is_valid:
-                valid_hypotheses.append(hypothesis_str)
-                mech_key = self.get_expression_mechanistic_key(hypothesis_str)
-                if mech_key and mech_key not in unique_mechanistic_keys:
-                    unique_mechanistic_keys.add(mech_key)
-                    unique_valid_expressions.append(hypothesis_str)
-        
         # Calculate metrics
         parse_success_rate = parse_success_count / n_queries if n_queries > 0 else 0
         in_space_rate = in_space_count / n_queries if n_queries > 0 else 0
