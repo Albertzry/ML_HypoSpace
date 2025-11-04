@@ -9,39 +9,23 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
----
-
-### 🎯 Three Domains • Three Metrics • Infinite Insights
-
-</div>
-
 <p align="center">
-  <img src="figs/overview.png" alt="Overview" height="220">
-  &nbsp;&nbsp;&nbsp;
-  <img src="figs/comp.png" alt="Model Comparison" height="220">
+  <img src="figs/logo.png" alt="Overview">
 </p>
 
-<p align="center">
-  <img src="figs/task.png" alt="Task Illustration" width="60%">
-</p>
+## 🙏 Thanks 🙏
+This project originates from NUS CEG EEC4300 and we gratefully acknowledge the foundational groundwork provided by [CTT-Pavilion/_HypoSpace](https://github.com/CTT-Pavilion/_HypoSpace).
 
-<div align="center">
-
-### 🧬 Causal Graphs • 📦 3D Reconstruction • 🔀 Boolean Logic
-
-</div>
-
----
 
 ## 📖 About
 
 > **TL;DR**: HypoSpace evaluates how well LLMs generate *diverse sets* of valid hypotheses in underdetermined scientific problems, not just single correct answers.
 
-### The Challenge
+### 🌈 The Challenge
 
 As language models are increasingly used in scientific workflows, evaluating their ability to propose **sets of explanations**—not just a single correct answer—becomes critical. Many scientific problems are **underdetermined**: multiple, mechanistically distinct hypotheses are consistent with the same observations.
 
-### Our Solution
+### 😊Original Solution
 
 We introduce **HypoSpace**, a diagnostic suite that treats LLMs as samplers of finite hypothesis sets and measures three complementary indicators:
 
@@ -51,6 +35,44 @@ We introduce **HypoSpace**, a diagnostic suite that treats LLMs as samplers of f
 | **✨ Uniqueness** | *U* | Non-redundancy among proposals |
 | **📈 Recovery** | *R* | Coverage of the enumerated admissible set |
 
+### 🤔Key Findings
+
+Across instruction-tuned and reasoning-focused models, **Validity** often remains high while **Uniqueness** and **Recovery** degrade as the admissible space grows, revealing **mode collapse** that is invisible to correctness-only metrics.
+
+> 💡 HypoSpace offers a controlled probe—rather than a leaderboard—for methods that explicitly explore and cover admissible explanation spaces.
+
+### ☝️ Our group solutions
+
+1. **🧬 Causal Graphs** Innovative LLM causal discovery: constraint-guided, hypothesis bank, structured prompts.
+
+2. **📦 3D Voxel Reconstruction** Innovative LLM 3D inference: loss-guided, annealing search, ensemble.
+
+3. **🔀 Boolean Genetic Interactions** Innovative solver-guided LLM discovery: library queue, synthesis hints, enforced reproduction.
+
+> 🧯 To increase task **complexity**, we chose a larger number of **nodes and blocks**, among other **more difficult options**, when generating the dataset.
+
+### ✨Results
+
+</div>
+
+<div style="text-align:center;">
+  <figure style="display:inline-block; margin:0 12px; text-align:center;">
+    <img src="figs/casual.png" alt="Causal" height="200" style="display:block; margin:0 auto;" />
+    <figcaption style="margin-top:6px; font-size:0.95em;">🧬 Causal Graphs</figcaption>
+  </figure>
+
+  <figure style="display:inline-block; margin:0 12px; text-align:center;">
+    <img src="figs/3d.png" alt="3D Reconstruction" height="200" style="display:block; margin:0 auto;" />
+    <figcaption style="margin-top:6px; font-size:0.95em;">📦 3D Reconstruction</figcaption>
+  </figure>
+
+  <figure style="display:inline-block; margin:0 12px; text-align:center;">
+    <img src="figs/bool.png" alt="Boolean Logic" height="200" style="display:block; margin:0 auto;" />
+    <figcaption style="margin-top:6px; font-size:0.95em;">🔀 Boolean Logic</figcaption>
+  </figure>
+</div>
+
+
 ### Three Structured Domains
 
 We instantiate HypoSpace in three domains with deterministic validators and exactly enumerated hypothesis spaces:
@@ -59,11 +81,6 @@ We instantiate HypoSpace in three domains with deterministic validators and exac
 2. **📦 3D Voxel Reconstruction** — gravity-constrained from top-down projections  
 3. **🔀 Boolean Genetic Interactions** — logical function discovery
 
-### Key Findings
-
-Across instruction-tuned and reasoning-focused models, **Validity** often remains high while **Uniqueness** and **Recovery** degrade as the admissible space grows, revealing **mode collapse** that is invisible to correctness-only metrics.
-
-> 💡 HypoSpace offers a controlled probe—rather than a leaderboard—for methods that explicitly explore and cover admissible explanation spaces.
 
 ---
 
@@ -121,7 +138,7 @@ Edit the YAML config files in each domain's `config/` folder:
 llm:
   type: openrouter              # Options: openai, anthropic, openrouter
   models:
-    openrouter: "openai/gpt-4o"
+    openrouter: "deepseek/deepseek-chat-v3-0324"
   api_keys:
     openrouter: "your-api-key"  # ⚠️ Replace with your actual API key
   temperature: 0.7              # 0.0 = deterministic, 1.0 = creative
@@ -142,7 +159,7 @@ Each domain has its own dataset generator. Here are examples for all three:
 ```bash
 cd causal
 python generate_causal_dataset.py \
-  --nodes 3 \
+  --nodes 4 \
   --seed 33550336 \
   --output "datasets/node03/n3_all_observations.json"
 ```
@@ -162,7 +179,7 @@ cd 3d
 python generate_3d_dataset_complete.py \
   --grid-size 3 \
   --max-height 3 \
-  --max-blocks 1 \
+  --max-blocks 3 \
   --fixed \
   --seed 33550336 \
   --output "datasets/3d_grid3_h3.json"
