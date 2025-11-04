@@ -55,22 +55,21 @@ Across instruction-tuned and reasoning-focused models, **Validity** often remain
 
 </div>
 
-<div style="text-align:center;">
-  <figure style="display:block; margin:0 auto; text-align:center;">
-    <img src="figs/casual.png" alt="Causal" height="200" style="display:block; margin:0 auto;" />
-    <figcaption style="margin-top:6px; font-size:0.95em;">🧬 Causal Graphs</figcaption>
-  </figure>
+| |
+|:--:|
+| ![Causal Graphs](figs/casual.png) |
+| *🧬 Causal Graphs* |
 
-  <figure style="display:block; margin:0 auto; text-align:center;">
-    <img src="figs/3d.png" alt="3D Reconstruction" height="200" style="display:block; margin:0 auto;" />
-    <figcaption style="margin-top:6px; font-size:0.95em;">📦 3D Reconstruction</figcaption>
-  </figure>
+| |
+|:--:|
+| ![3D Reconstruction](figs/3d.png) |
+| *📦 3D Reconstruction* |
 
-  <figure style="display:block; margin:0 auto; text-align:center;">
-    <img src="figs/bool.png" alt="Boolean Logic" height="200" style="display:block; margin:0 auto;" />
-    <figcaption style="margin-top:6px; font-size:0.95em;">🔀 Boolean Logic</figcaption>
-  </figure>
-</div>
+| |
+|:--:|
+| ![Boolean Logic](figs/bool.png) |
+| *🔀 Boolean Logic* |
+
 
 
 ### Three Structured Domains
